@@ -1,0 +1,42 @@
+{
+  "cache_manifest": {
+    "format_version": 1,
+    "count": 100014,
+    "num_query": 6405,
+    "gamma": 0.05,
+    "uad": {
+      "path": "/project/code/WHU_base/WHU_ViSA+QVAM/logs/UAD_1000_single/transformer_120.pth",
+      "sha256": "80255a937ceb07cd090c8308a1a6114c686c5b9387274ab5e3d193a57ba638b5",
+      "epoch": null,
+      "world_size": null,
+      "training_signature": null,
+      "training_details_status": "unknown_model_only_checkpoint"
+    },
+    "a1": {
+      "path": "/project/code/WHU_base/WHU_ViSA+QVAM/logs/UAD_A1_1000_single/transformer_120.pth",
+      "sha256": "d40e0461b6a31cf0e45845efe89f44e93a274850222febaa61fcd64904ab5e5e",
+      "epoch": null,
+      "world_size": null,
+      "training_signature": null,
+      "training_details_status": "unknown_model_only_checkpoint"
+    },
+    "uad_config": "DATALOADER:\n  NUM_INSTANCE: 4\n  NUM_WORKERS: 8\n  SAMPLER: PKM\nDATASETS:\n  DATASET_DIR: WHU-MARS\n  FILTER_GD: false\n  MODALITIES:\n  - RGB\n  - IR\n  - Thermal\n  NAMES: WHU-MARS\n  ROOT_DIR: /project/code/data\nINPUT:\n  PADDING: 10\n  PIXEL_MEAN:\n  - 0.5\n  - 0.5\n  - 0.5\n  PIXEL_STD:\n  - 0.5\n  - 0.5\n  - 0.5\n  PROB: 0.5\n  RE_PROB: 0.5\n  SIZE_TEST:\n  - 256\n  - 128\n  SIZE_TRAIN:\n  - 256\n  - 128\nMODEL:\n  ATT_DROP_RATE: 0.0\n  COS_LAYER: false\n  DEVICE: cuda\n  DEVICE_ID: '0'\n  DEVIDE_LENGTH: 4\n  DIST_TRAIN: false\n  DROP_OUT: 0.0\n  DROP_PATH: 0.1\n  FEATURE_AUG:\n    DIM: 192\n    GAMMA: 0.05\n    LOCAL_CE_WEIGHT: 0.05\n    LOCAL_TAU: 0.1\n    MASK_OUT_INIT_STD: 0.005\n    NUM_HEADS: 4\n    NUM_QUERY: 2\n    TOPK: 16\n    TYPE: none\n  GPD_MOMENTUM: 0.2\n  ID_LOSS_TYPE: softmax\n  ID_LOSS_WEIGHT: 1.0\n  IF_LABELSMOOTH: 'off'\n  IF_WITH_CENTER: 'no'\n  JPM: false\n  LAST_STRIDE: 1\n  METRIC_LOSS_TYPE: wrt\n  NAME: transformer\n  NECK: bnneck\n  NO_MARGIN: true\n  PCA_LOSS_WEIGHT: 0.01\n  PRETRAIN_CHOICE: none\n  PRETRAIN_PATH: jx_vit_base_p16_224-80ecf9dd.pth\n  RE_ARRANGE: true\n  SHIFT_NUM: 5\n  SHUFFLE_GROUP: 2\n  SIE_CAMERA: false\n  SIE_COE: 3.0\n  SIE_VIEW: false\n  STRIDE_SIZE:\n  - 16\n  - 16\n  TRANSFORMER_TYPE: vit_base_in\n  TRIPLET_LOSS_WEIGHT: 1.0\nOUTPUT_DIR: ./logs/UAD_1000\nSOLVER:\n  BASE_LR: 0.008\n  BIAS_LR_FACTOR: 2\n  CENTER_LOSS_WEIGHT: 0.0005\n  CENTER_LR: 0.5\n  CHECKPOINT_PERIOD: 120\n  COSINE_MARGIN: 0.5\n  COSINE_SCALE: 30\n  EVAL_PERIOD: 10\n  GAMMA: 0.1\n  IMS_PER_BATCH: 64\n  LARGE_FC_LR: false\n  LOG_PERIOD: 50\n  LOSS_TYPE: base+pca+gpd\n  MARGIN: 0.3\n  MAX_EPOCHS: 120\n  MOMENTUM: 0.9\n  OPTIMIZER_NAME: SGD\n  RESUME: ''\n  SEED: 1234\n  STEPS:\n  - 40\n  - 70\n  WARMUP_EPOCHS: 5\n  WARMUP_FACTOR: 0.01\n  WARMUP_METHOD: linear\n  WEIGHT_DECAY: 0.0001\n  WEIGHT_DECAY_BIAS: 0.0001\nTEST:\n  DETAILED_DOMAIN_EVAL: false\n  DIST_MAT: dist_mat.npy\n  EVAL: false\n  FEAT_NORM: 'yes'\n  IMS_PER_BATCH: 128\n  NECK_FEAT: before\n  RE_RANKING: false\n  TOP_K_EVAL: 0\n  WEIGHT: ''\n",
+    "a1_config": "DATALOADER:\n  NUM_INSTANCE: 4\n  NUM_WORKERS: 8\n  SAMPLER: PKM\nDATASETS:\n  DATASET_DIR: WHU-MARS\n  FILTER_GD: false\n  MODALITIES:\n  - RGB\n  - IR\n  - Thermal\n  NAMES: WHU-MARS\n  ROOT_DIR: /project/code/data\nINPUT:\n  PADDING: 10\n  PIXEL_MEAN:\n  - 0.5\n  - 0.5\n  - 0.5\n  PIXEL_STD:\n  - 0.5\n  - 0.5\n  - 0.5\n  PROB: 0.5\n  RE_PROB: 0.5\n  SIZE_TEST:\n  - 256\n  - 128\n  SIZE_TRAIN:\n  - 256\n  - 128\nMODEL:\n  ATT_DROP_RATE: 0.0\n  COS_LAYER: false\n  DEVICE: cuda\n  DEVICE_ID: '0'\n  DEVIDE_LENGTH: 4\n  DIST_TRAIN: false\n  DROP_OUT: 0.0\n  DROP_PATH: 0.1\n  FEATURE_AUG:\n    DIM: 192\n    GAMMA: 0.05\n    LOCAL_CE_WEIGHT: 0.05\n    LOCAL_TAU: 0.1\n    MASK_OUT_INIT_STD: 0.005\n    NUM_HEADS: 4\n    NUM_QUERY: 2\n    TOPK: 16\n    TYPE: a1\n  GPD_MOMENTUM: 0.2\n  ID_LOSS_TYPE: softmax\n  ID_LOSS_WEIGHT: 1.0\n  IF_LABELSMOOTH: 'off'\n  IF_WITH_CENTER: 'no'\n  JPM: false\n  LAST_STRIDE: 1\n  METRIC_LOSS_TYPE: wrt\n  NAME: transformer\n  NECK: bnneck\n  NO_MARGIN: true\n  PCA_LOSS_WEIGHT: 0.01\n  PRETRAIN_CHOICE: none\n  PRETRAIN_PATH: jx_vit_base_p16_224-80ecf9dd.pth\n  RE_ARRANGE: true\n  SHIFT_NUM: 5\n  SHUFFLE_GROUP: 2\n  SIE_CAMERA: false\n  SIE_COE: 3.0\n  SIE_VIEW: false\n  STRIDE_SIZE:\n  - 16\n  - 16\n  TRANSFORMER_TYPE: vit_base_in\n  TRIPLET_LOSS_WEIGHT: 1.0\nOUTPUT_DIR: ./logs/UAD_A1_1000\nSOLVER:\n  BASE_LR: 0.008\n  BIAS_LR_FACTOR: 2\n  CENTER_LOSS_WEIGHT: 0.0005\n  CENTER_LR: 0.5\n  CHECKPOINT_PERIOD: 120\n  COSINE_MARGIN: 0.5\n  COSINE_SCALE: 30\n  EVAL_PERIOD: 10\n  GAMMA: 0.1\n  IMS_PER_BATCH: 64\n  LARGE_FC_LR: false\n  LOG_PERIOD: 50\n  LOSS_TYPE: base+pca+gpd\n  MARGIN: 0.3\n  MAX_EPOCHS: 120\n  MOMENTUM: 0.9\n  OPTIMIZER_NAME: SGD\n  RESUME: ''\n  SEED: 1234\n  STEPS:\n  - 40\n  - 70\n  WARMUP_EPOCHS: 5\n  WARMUP_FACTOR: 0.01\n  WARMUP_METHOD: linear\n  WEIGHT_DECAY: 0.0001\n  WEIGHT_DECAY_BIAS: 0.0001\nTEST:\n  DETAILED_DOMAIN_EVAL: false\n  DIST_MAT: dist_mat.npy\n  EVAL: false\n  FEAT_NORM: 'yes'\n  IMS_PER_BATCH: 128\n  NECK_FEAT: before\n  RE_RANKING: false\n  TOP_K_EVAL: 0\n  WEIGHT: ''\n",
+    "samples_sha256": "189c575370abe3f29b764630a0463f88d7027cb2934ec0e61b0d135381d5cc1b",
+    "stability_brightness_factor": null,
+    "inference": "eval, float32, no autocast, raw pre-BN features",
+    "ordering": "all modality queries, then all modality galleries; shared loader"
+  },
+  "gamma_sensitivity": [],
+  "detailed_domains": false,
+  "chunk_size": 64,
+  "metric_units": "metrics/AP/INP/fractions: 0..1; summary deltas: percentage points",
+  "distance": "squared Euclidean after float32 L2 normalization",
+  "caveats": [
+    "A1-CLS is not a retrained ablation.",
+    "Gamma sweep is inference-only sensitivity.",
+    "Training seed/updates cannot be recovered from model-only weights.",
+    "Independent checkpoint feature vectors are not compared by cosine.",
+    "No causal conclusions or statistical significance from one checkpoint pair."
+  ]
+}

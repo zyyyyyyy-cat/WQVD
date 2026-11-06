@@ -1,0 +1,23 @@
+[
+  "WHU/tests/test_a1_diagnostics.py::test_diagnostic_interface_preserves_forward_state",
+  "WHU/tests/test_a1_diagnostics.py::test_export_shared_loader_query_gallery_order_and_stability",
+  "WHU/tests/test_a1_diagnostics.py::test_official_metrics_parity_and_chunk_invariance",
+  "WHU/tests/test_a1_diagnostics.py::test_offline_cache_reports_and_integrity",
+  "WHU/tests/test_a1_diagnostics.py::test_rank1_down_ap_up_and_missing_negative",
+  "WHU/tests/test_a1_diagnostics.py::test_residual_direction_overlap_and_entropy",
+  "WHU/tests/test_a1_diagnostics.py::test_same_camera_negative_exclusion_and_invalid_query",
+  "WHU/tests/test_feature_aug.py::test_a1_amp_scores_stay_fp32",
+  "WHU/tests/test_feature_aug.py::test_a1_shapes_selection_and_detach[128]",
+  "WHU/tests/test_feature_aug.py::test_a1_shapes_selection_and_detach[1]",
+  "WHU/tests/test_feature_aug.py::test_a1_shapes_selection_and_detach[7]",
+  "WHU/tests/test_feature_aug.py::test_a2_initialization_gradient_and_patch_dependency",
+  "WHU/tests/test_feature_aug.py::test_baseline_matches_pre_edit_snapshot",
+  "WHU/tests/test_feature_aug.py::test_checkpoint_migration_and_rejections",
+  "WHU/tests/test_feature_aug.py::test_full_resume_reproduces_next_update",
+  "WHU/tests/test_feature_aug.py::test_full_vit_training_losses_optimizer_and_inference[a1]",
+  "WHU/tests/test_feature_aug.py::test_full_vit_training_losses_optimizer_and_inference[a2]",
+  "WHU/tests/test_feature_aug.py::test_full_vit_training_losses_optimizer_and_inference[none]",
+  "WHU/tests/test_feature_aug.py::test_imagenet_interpolation_and_missing_keys",
+  "WHU/tests/test_feature_aug.py::test_main_and_local_identity_criterion_smoothing",
+  "WHU/tests/test_feature_aug.py::test_token_taps_are_exact_one_pass"
+]

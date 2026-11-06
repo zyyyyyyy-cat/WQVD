@@ -1,0 +1,84 @@
+{
+  "date": "2026-10-10",
+  "cpu_tests": {
+    "passed": 14,
+    "full_vit_input": [
+      256,
+      128
+    ],
+    "baseline_equal_to_pre_edit_snapshot": true,
+    "comparison_tolerance": 0,
+    "final_run_seconds": 39.66
+  },
+  "synthetic_optimization": {
+    "steps_per_branch": 50,
+    "finite_nonzero_branch_gradients": true,
+    "report": "logs/feature_aug_synthetic_check.json"
+  },
+  "ddp": {
+    "passed": true,
+    "backend": "gloo",
+    "world_size": 2,
+    "torch": "2.7.1+cpu",
+    "torchvision": "0.22.1+cpu",
+    "input": [
+      32,
+      32
+    ],
+    "steps_per_mode": 2,
+    "parameter_and_prototype_sync": true,
+    "uneven_validation_forwards": true,
+    "rank_rng_buffers_resume_exact": true
+  },
+  "original_functions_unchanged": [
+    "PCA",
+    "GPD",
+    "PrototypeBank"
+  ],
+  "original_files_unchanged": [
+    "configs/UAD.yml",
+    "datasets/make_dataloader.py",
+    "datasets/sampler.py",
+    "datasets/sampler_ddp.py",
+    "utils/metrics.py",
+    "solver/make_optimizer.py"
+  ],
+  "modified_files": [
+    "model/make_model.py",
+    "model/backbones/vit_pytorch.py",
+    "processor/processor.py",
+    "config/defaults.py",
+    "loss/make_loss.py",
+    "train.py",
+    "test.py"
+  ],
+  "not_verified": [
+    "real WHU-MARS training or accuracy",
+    "real historical UAD checkpoints/logs",
+    "CUDA FP16 AMP",
+    "four-GPU NCCL"
+  ],
+  "notes": [
+    "Pre-edit snapshot and isolated test environment are under workspace tmp/.",
+    "Only self-checks possible in the current environment were performed."
+  ],
+  "added_source_files": [
+    "model/modules/__init__.py",
+    "model/modules/common.py",
+    "model/modules/a1_local.py",
+    "model/modules/a2_modulation.py",
+    "utils/checkpoint.py",
+    "configs/UAD_A1.yml",
+    "configs/UAD_A2.yml",
+    "tests/test_feature_aug.py",
+    "tests/ddp_feature_aug.py",
+    "tools/check_feature_aug.py",
+    "IMPLEMENTATION_A1_A2.md"
+  ],
+  "deleted_source_files": [],
+  "entrypoint_checks": [
+    "train.py --help",
+    "test.py --help",
+    "compileall"
+  ]
+}

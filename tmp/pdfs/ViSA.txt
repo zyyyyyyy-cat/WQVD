@@ -1,0 +1,1674 @@
+PAGE 1
+View-Aware Semantic Alignment for Aerial-Ground Person Re-Identification
+Quan Zhang1∗Zeqiang Cai1∗Peiming Zhao1 Jingze Wu1 Cailun Wu1
+Hongbo Chen1 Jianhuang Lai1,2,3,4†
+1 Sun Yat-sen University, China
+2 Pazhou Lab (HuangPu), Guangdong, China
+3 Guangdong Province Key Laboratory of Information Security Technology, Guangzhou, China
+4 Key Laboratory of Machine Intelligence and Advanced Computing, Ministry of Education, China
+{zhangq689, wuclun, chenhongbo, stsljh}@mail.sysu.edu.cn,
+{caizq5, zhaopm, wujz3}@mail2.sysu.edu.cn
+Abstract
+Aerial-Ground Person Re-Identification (AGPReID) re-
+mains highly challenging due to drastic viewpoint varia-
+tions between drones and fixed cameras. Existing methods
+typically follow a view-invariant paradigm, aligning shared
+features across views to achieve robustness. However, view-
+invariant inherently enforces part-level alignment, which
+ignores view-specific cues and discriminative identity in-
+formation.
+To this end, this work proposes ViSA (View-
+aware Semantic Alignment), a view-aware framework that
+achieves cross-view semantic consistency containing an
+Expert-driven Token Generation Module (ETGM) and a
+Dual-branch Local Fusion Module (DLFM). Technically,
+the former constructs a set of view-aware experts to gen-
+erate adaptive semantic queries that perceive viewpoint-
+specific patterns, while the latter leverages graph reason-
+ing to extract and align local regions responsive to dif-
+ferent experts. Extensive experiments on three AGPReID
+benchmarks including AG-ReID.v2, CARGO and LAGPeR
+demonstrate that ViSA consistently achieves superior per-
+formance, with a notable 10.06% mAP improvement on the
+challenging CARGO cross-view protocol. The code is avail-
+able at https://github.com/Cat-Zero/ViSA.
+1. Introduction
+Person Re-Identification (ReID) aims to match pedestrian
+images of the same individual across non-overlapping cam-
+eras. While conventional ReID models have achieved re-
+markable progress under single view settings [1–14], their
+assumptions break down when facing drastic viewpoint dis-
+parities introduced by aerial and ground sensors. The inte-
+gration of drones into surveillance networks gives rise to the
+∗Equal contribution.
+† Corresponding author.
+Ground View
+Aerial View
+part-level alignment
+View-invariant 
+Learning
+View-aware
+Learning
+semantic-level alignment
+Most 
+Discriminative 
+Part
+View-Specific 
+Parts Influential 
+in ReID
+previous
+ours
+Figure 1. Comparison of view-invariant and view-aware learning.
+View-invariant learning typically converges to part-level align-
+ment, whereas view-aware learning achieves semantic-level per-
+ception for more robust cross-view representations.
+Aerial-Ground Person Re-Identification (AGPReID) prob-
+lem [15–18], which involves extreme viewpoint variations.
+Most existing AGPReID methods follow a view-
+invariant paradigm that aligns shared representations across
+heterogeneous viewpoints [19–22]. As illustrated in Fig.1,
+although effective to some extent, this paradigm en-
+forces excessive cross-view alignment, resulting in shared-
+part matching and inadvertently suppressing discriminative,
+view-specific cues that are closely correlated with identity
+such as leg under ground view and shoulder under aerial
+view. Moreover, existing methods predominantly rely on
+global representations, overlooking that fine-grained iden-
+tity evidence often resides in local patch regions. In aerial
+imagery, steep downward angles and occlusions often cause
+the loss of partial body parts, which are highly discrimina-
+tive in ground-view images, further challenging the relia-
+arXiv:2605.18192v1  [cs.CV]  18 May 2026
+
+PAGE 2
+bility of global descriptors. These limitations motivate a
+paradigm shift. Instead of suppressing viewpoint factors, an
+effective AGPReID framework should achieve cross-view
+semantic consistency by disentangling viewpoint variations
+while retaining and leveraging view-specific identity cues.
+To this end, we propose ViSA (View-aware Semantic
+Alignment), a view-aware framework designed to jointly
+capture view-invariant identity cues and view-specific dis-
+criminative features. At the core of ViSA are two comple-
+mentary modules that operate on top of a view-aware back-
+bone. First, the Expert-driven Token Generation Module
+(ETGM) constructs a set of learnable, view-aware expert
+tokens from both the view-invariant and view-specific rep-
+resentations produced by the encoder. Each expert special-
+izes in capturing distinct identity patterns that may mani-
+fest differently under aerial or ground perspectives. By em-
+ploying a mixture-of-experts mechanism, ETGM adaptively
+routes information from local patch tokens into semantic
+queries that preserve complementary identity cues while
+maintaining separation between invariant and viewpoint-
+dependent components.
+The Dual-branch Local Fusion
+Module (DLFM) extracts and aligns discriminative local
+features in a structured manner. Specifically, for each ex-
+pert query, DLFM selects a sparse set of the most seman-
+tically relevant local patches using cosine similarity, form-
+ing a query-guided neighborhood graph. A graph convolu-
+tional network then operates on this query-augmented local
+graph to capture structural relationships among the selected
+patches, effectively embedding each expert into its respon-
+sive local regions. By maintaining separate branches for
+view-invariant and view-specific queries, DLFM ensures
+that both robust identity information and systematic view-
+point variations are preserved. Finally, the refined local fea-
+tures from both branches are concatenated with the global
+[CLS] token, producing a comprehensive and discrimina-
+tive representation suitable for cross-view retrieval.
+In summary, our main contributions are as follows:
+• We propose a view-aware semantic alignment paradigm
+for AGPReID, which learns to disentangle and jointly ex-
+ploit both view-invariant and view-specific cues.
+This
+design enables more comprehensive and robust identity
+modeling across highly heterogeneous viewpoints.
+• We design ViSA (View-aware Semantic Alignment), a
+novel framework that integrates an Expert-driven To-
+ken Generation Module (ETGM) for adaptive view-aware
+query construction and a Dual-branch Local Fusion Mod-
+ule (DLFM) for expert-guided local feature alignment
+across aerial and ground views.
+• We conduct extensive experiments on three large-scale
+benchmarks including AG-ReID.v2, CARGO, and LAG-
+PeR, demonstrating that ViSA consistently surpasses
+state-of-the-art methods and achieves up to a 10.06%
+mAP improvement under cross-view protocol.
+2. Related Work
+2.1. Aerial-Ground Person ReID
+With the rapid development of UAV-based imaging technol-
+ogy, AGPReID has attracted increasing attention. Nguyen
+et al. [15] first introduced the AG-ReID.v1 dataset and pro-
+posed a dual-stream interpretable network that leverages at-
+tribute information to mitigate the challenges of cross-view
+retrieval. They later extended this dataset to AG-ReID.v2
+[17], emphasizing head-region features to further improve
+cross-view matching performance. Hu et al. [23] adopted
+prompt-tuning strategies to incorporate attribute-based tex-
+tual knowledge into model training, enabling more effective
+utilization of semantic information.
+Unlike attribute-based approaches, which require ex-
+pensive manual annotations, VDT [19] explored a view-
+invariant paradigm from the perspective of view decou-
+pling, aiming to capture shared representations across
+views.
+Building upon this paradigm, several subsequent
+works further advanced its performance: DTST [24] pro-
+posed dynamic token selection to enhance feature represen-
+tation, and SeCap [21] leveraged prompt learning to capture
+local features. Recently, VIF-AGReID [22] proposed patch-
+level rotational augmentation and an angular-penalty loss to
+strengthen view-invariant feature learning in aerial-ground
+scenarios. Despite their effectiveness, these methods funda-
+mentally rely on shared-part alignment, which enforces the
+alignment of view-specific parts and consequently limits the
+model’s ability to capture full-body pedestrian information.
+This limitation motivates our proposed view-aware seman-
+tic alignment, which aims to preserve view-invariance while
+fully exploiting global information.
+2.2. Mixture of Experts in ReID
+Mixture-of-Experts (MoE) models [25, 26] consist of multi-
+ple expert networks coordinated by a gating network, which
+dynamically selects the most suitable expert to process a
+given input. MoE has demonstrated remarkable effective-
+ness across various fields, including computer vision [27–
+29] and multimodal learning [30–32]. In ReID, MoE ar-
+chitectures have also shown promising potential. MoSCE-
+ReID [33] proposed a MoE architecture specifically de-
+signed for distinct attribute groups, effectively addressing
+inherent attribute conflicts and generalization challenges in
+ReID. HAMoBE [34] mimics human perceptual mecha-
+nisms by independently modeling key biometric features
+and adaptively integrating them. Additionally, numerous
+other works [35, 36] have explored various MoE variants in
+ReID to enhance feature expressiveness and generalization.
+Despite the significant progress of existing MoE meth-
+ods, the design of experts specifically targeting view vari-
+ations remains largely unexplored. This observation mo-
+tivates our proposed view-specific experts, which allo-
+
+PAGE 3
+: View-aware Local Token
+ETGM
+View-inv Graph Learning
+Share Experts
+Share Router
+Share Experts
+Share Experts
+Aerial Experts
+Aerial Router
+Ground Experts
+Ground Router
+: Ground View Token
+: Aerial View Token
+: Local Feature Token
+: Class Token
+: View-invariant Token
+: Subsection Operator
+C : Concatenate Operator
+: Share Expert Token
+: Aerial-aware Expert Token
+: Ground-aware Expert Token
+Vit Encoder Layer
+Vit Encoder Layer
+……
+Vit Encoder Layer
+View Aware Backbone
+View-spe Graph Learning
+C
+CLS
+Self-Atten.
+FFN
+C
+DLFM
+N×
+N×
+N×
+1
+3
+2
+...
+...
+...
+...
+...
+...
+...
+...
+...
+Figure 2. Overview of the proposed ViSA. The transformer backbone first separates intrinsic identity semantics from extrinsic viewpoint
+factors using dual aerial/ground tokens. Then the Expert-driven Token Generation Module (ETGM) employs a mixture-of-experts mech-
+anism including shared, aerial, and ground experts to generate adaptive semantic tokens guided by corresponding routers. Finally the
+Dual-branch Local Fusion Module (DLFM) performs graph-based reasoning to decode view-invariant and view-specific local features.
+View-inv Graph Learning and View-spe Graph Learning represents the view-invariant branch and view-specific branch respectively.
+cate dedicated experts for different viewpoints, enabling
+more effective modeling of cross-view feature discrepan-
+cies while preserving global pedestrian information.
+2.3. Graph Convolutional Networks in ReID
+Graph Convolutional Networks (GCNs) are capable of
+propagating and aggregating features over graph-structured
+data and have received increasing attention in ReID tasks
+in recent years. GPS [37] constructed graphs from pedes-
+trian attribute labels and visual features, leveraging GCNs
+to learn the topological structure of the human body and
+integrating it into the ReID framework to enhance feature
+representations.
+To address occluded pedestrian scenar-
+ios, ADGC [38] proposed utilizing topological information
+and higher-order relationships to achieve robust alignment,
+while RTGAT [39] designed an inference-and-refinement
+graph attention network to learn complete representations
+from occluded images. Inspired by these works, our method
+leverages GCNs to capture view-aware topological infor-
+mation from local features, enabling cross-view semantic
+alignment and more robust pedestrian representations.
+3. Method
+3.1. Problem Statement
+In cross-view person re-identification, the visual observa-
+tion I of a person is jointly determined by intrinsic iden-
+tity factors X (e.g., body shape, appearance) and extrinsic
+viewpoint factors V (e.g., camera angle, height, and per-
+spective distortion). The feature representation Z extracted
+by a neural encoder therefore inevitably entangles these two
+underlying sources of variation:
+Z = f(I) = f(X, V ).
+(1)
+Such entanglement makes it challenging to separate iden-
+tity cues from viewpoint variations, especially under drastic
+aerial-ground changes. When the viewpoint V changes sig-
+nificantly, the same identity produces very different obser-
+vations, making Z highly view-biased. Traditional methods
+suppress the influence of V to learn view-invariant features,
+but such suppression often removes useful discriminative
+cues correlated with identity, leading to information loss.
+To formally describe this trade-off between invariance
+and discriminability, we adopt an information-theoretic per-
+spective, where the representation should contain sufficient
+information for identity recognition while minimizing irrel-
+evant dependencies on viewpoint:
+max I(Z; Y ) s.t. I(Z; V ) is minimized,
+(2)
+where Y denotes the person identity label. However, strictly
+minimizing I(Z; V ) may also reduce I(Z; Y ), because
+some view-related cues (e.g., shape consistency, clothing
+folds) are partially correlated with identity. To balance this
+
+PAGE 4
+Token Expert Module
+GCN
+View-invariant / View-specific Graph Learning Module
+Local  Selector
+Top-k
+View-invariant Token (or View Token)
+Local Feature
+View-aware Local Tokens
+Learnable Tokens
+Cross  Attn.
+Self  Attn.
+FFN
+View-invariant Token
+(or View Token)
+View-aware Tokens
+View-aware Tokens
+Figure 3. Modules detail of the Token Expert Module and Graph Learning Module. The Token Expert Module generates view-aware expert
+tokens from view tokens and view-invariant tokens. The Graph Learning Module fuses view-aware tokens with a patch-level graph via
+graph convolution to refine local cues and enhance cross-view ReID representations.
+trade-off, we adopt a disentangled representation:
+Z = [Zinv, Zspe], I(Zinv; V ) ≈0, I(Zspe; V ) > 0,
+(3)
+where Zinv preserves identity-relevant, view-invariant se-
+mantics, while Zspe explicitly encodes the systematic ap-
+pearance variations induced by viewpoint. Such decompo-
+sition avoids the information bottleneck caused by adversar-
+ial suppression and allows the model to exploit complemen-
+tary cues between Zinv and Zspe. This theoretical insight
+directly inspires our framework design, where the encoder
+explicitly decouples Zinv and Zspe, and the decoder hierar-
+chically re-fuses them to robustly preserve both fine-grained
+identity and viewpoint information.
+3.2. Framework
+The overall architecture of ViSA is illustrated in Fig. 2,
+following an encoder-decoder design. The encoder extracts
+multi-view semantic representations, while the decoder ex-
+plicitly disentangles and aggregates fine-grained identity
+cues to produce discriminative cross-view features.
+The proposed ViSA is built upon the View-Decoupled
+Transformer (VDT) [19] and extend its design to a dual-
+stream encoder that preserves both invariant and viewpoint-
+sensitive semantics.
+Each layer introduces independent
+learnable tokens for aerial and ground views, allowing the
+model to capture viewpoint characteristics. Following VDT,
+the [CLS] token progressively subtracts its corresponding
+view token, removing spurious view bias and forming a
+more view-invariant and holistic global representation.
+However, the [CLS] token alone cannot capture dis-
+tributed identity cues such as clothing textures, body poses,
+and local semantics, which are intertwined with view-
+point variations.
+To address this limitation, we intro-
+duce two complementary modules in the decoder.
+The
+Expert-driven Token Generation Module (ETGM) per-
+forms viewpoint-aware query routing through a mixture-
+of-experts mechanism, while the Dual-branch Local Fu-
+sion Module (DLFM) employs graph reasoning to refine
+patch-level representations.
+Together, they recover fine-
+grained identity cues while maintaining explicit modeling
+of viewpoint-dependent variations. The final feature repre-
+sentation concatenates refined local features with the [CLS]
+token, yielding a robust and discriminative embedding for
+aerial-ground re-identification.
+3.3. Expert-driven Token Generation Module
+To exploit the distributed identity information in local patch
+tokens while handling viewpoint variations, we propose the
+Expert-driven Token Generation Module (ETGM), which
+produces a set of semantic-guided query tokens to disen-
+tangle view-invariant and view-related features. Formally,
+given the encoder outputs Zinv and Zspe, ETGM generates
+queries Qinv and Qspe satisfying:
+Qinv = ETGM(Zinv), I(Qinv; Y ) is minimized,
+(4)
+Qspe = ETGM(Zspe),
+(5)
+I(Qinv; V ) ≈0, I(Qspe; Y |V ) > 0,
+(6)
+where Y denotes identity labels and V denotes viewpoints.
+As shown in Fig.3, each expert in the MoE consists of
+a learnable token set {t1, . . . , tM}, which interacts with
+the input features through a transformer block comprising
+cross-attention, self-attention, and feed-forward layers:
+T ′ = FFN(SelfAttn(CrossAttn(T, Z))),
+(7)
+
+PAGE 5
+where T are the expert tokens and Z is the input feature
+(Zinv or Zspe). Cross-attention allows the tokens to inte-
+grate information from the input feature, self-attention en-
+ables interaction between tokens, and the FFN provides a
+non-linear transformation. The outputs of multiple selected
+experts are aggregated via a weighted sum to form the final
+query tokens Qinv and Qspe.
+From an information-theoretic perspective, this design
+maximizes the mutual information between the query and
+the identity label while explicitly preserving conditional
+view-dependent information. By separating view-invariant
+and view-related queries, ETGM provides flexible, dis-
+tributed guidance for downstream local feature aggregation
+in the DLFM module, ensuring that both core identity cues
+and auxiliary view-dependent identity signals are retained.
+3.4. Dual-branch Local Fusion Module
+The Dual-branch Local Fusion Module (DLFM) aims to ex-
+ploit the distributed identity information embedded in local
+patch tokens while explicitly modeling viewpoint depen-
+dencies. Guided by the expert queries generated by ETGM,
+DLFM contains a view-invariant branch and a view-related
+branch, each equipped with a Graph Convolutional Network
+to capture structural relations among local tokens.
+The detail of graph learning module used in DLFM is
+shown in Fig.3. Formally, given the local patch feature set
+F = {fi}N
+i=1 from the encoder and the expert queries Qinv
+and Qspe, a naive approach would directly apply cross-
+attention between Q and F. However, such attention ne-
+glects the distributed structural information inherently en-
+coded within local patches. To overcome this, each query
+first selects the top-K most semantically relevant local to-
+kens based on cosine similarity:
+Nk(Z) = TopK(cos(Z, F)),
+(8)
+where
+cos(i, j) =
+x⊤
+i xj
+∥xi∥2∥xj∥2
+,
+i, j ∈{1, . . . , N}.
+(9)
+This sparse neighborhood selection enforces semantic
+locality, allowing the model to focus on regions that share
+consistent semantics with the query while suppressing ir-
+relevant patches. Based on the selected neighbors, a fully
+connected local graph G = {Nk(Z), A(Z)} is constructed,
+where each edge weight encodes pairwise cosine similarity:
+Aij(Z) = cos(fi, fj),
+fi, fj ∈Nk(Z).
+(10)
+To further inject query semantics into local reasoning,
+the graph is augmented by inserting the query token Q as an
+additional node, forming an expanded node set Nqv(Q) =
+[Q, Nk(Z)]. The corresponding edge matrices for the in-
+variant and view-related branches are defined as:
+Aqv(Q) =
+
+1
+sim(Q, Nk(Z))
+sim(Nk(Z), Q)
+Nk(Z)
+
+.
+(11)
+This query-augmented graph enables the model to em-
+bed each query into the local feature manifold, integrating
+richer structural and semantic relations from the most rele-
+vant local regions. We then apply a dedicated GCN gqv to
+adapt Q within each subgraph:
+N ∗
+qv(Q) = gqv(Nqv(Q), ˆAqv(Q)),
+(12)
+where ˆA denotes the Laplacian-normalized adjacency ma-
+trix.
+The refined queries ˆQ = N ∗
+qv(Q)[0, :] from both
+branches are concatenated and fused with the global [CLS]
+token via a self-attention block:
+Flocal = Attn([ ˆQinv, ˆQspe, CLS]),
+(13)
+yielding the final local representation.
+By combining semantic sparsification (Top-k selec-
+tion) with dual-branch disentanglement, DLFM jointly cap-
+tures identity-consistent and view-dependent cues in a uni-
+fied representation.
+The invariant branch provides ro-
+bust identity-discriminative features, while the view-related
+branch models systematic viewpoint-dependent variations,
+thereby enhancing overall cross-view discriminability.
+3.5. Optimization
+Our model is jointly optimized with multiple objectives
+that supervise identity learning, viewpoint disentanglement,
+and expert utilization. These joint objectives together en-
+sure that ViSA learns highly identity-discriminative yet
+viewpoint-adaptive feature representations.
+Identity Supervision. To learn discriminative and compact
+identity embeddings, we employ the standard cross-entropy
+loss and triplet loss for each xi ∈B:
+Lid = −1
+|B|
+|B|
+X
+i=1
+log p(yi|fi),
+(14)
+Ltri =
+1
+|B|
+|B|
+X
+i=1
+
+||fi, f +
+i ||2
+2 −||fi, f −
+i ||2
+2 + m
+
++ .
+(15)
+where |B| is the batch size, fi denotes the global or refined
+local feature of the i-th sample, and m is the margin.
+Viewpoint Classification and Disentanglement. To ex-
+plicitly capture viewpoint information, a lightweight binary
+classifier predicts the camera domain (ground vs. aerial)
+from the view token. The corresponding classification loss
+is then formulated as:
+Lview = −1
+|B|
+|B|
+X
+i=1
+vi log ˆvi,
+(16)
+
+PAGE 6
+Table 1. Performance comparison on CARGO dataset. ‘ALL’ denotes the overall retrieval performance. ‘G↔G’, ‘A↔A’, ‘A↔G’ rep-
+resents the performance of each model in several specific retrieval patterns. The best and second-best results are highlighted in bold and
+underline, respectively for clear comparative emphasis.
+Method
+Venue
+ALL
+A↔G
+G↔G
+A↔A
+Rank-1
+mAP
+Rank-1
+mAP
+Rank-1
+mAP
+Rank-1
+mAP
+MGN[40]
+ACM MM’18
+54.81
+49.08
+31.87
+33.47
+83.93
+71.05
+65.00
+52.96
+BoT[41]
+CVPR’19
+54.81
+46.49
+36.25
+32.56
+77.68
+66.47
+65.00
+49.79
+VV[42]
+JAISCR’20
+45.83
+38.84
+31.25
+29.00
+72.31
+62.99
+67.50
+49.73
+PCB[43]
+TPAMI’21
+51.00
+44.50
+34.40
+30.40
+74.10
+67.60
+55.00
+44.60
+AGW[44]
+TPAMI’21
+60.26
+53.44
+43.57
+40.90
+81.25
+71.66
+67.50
+56.48
+SBS[45]
+ACM MM’23
+50.32
+43.09
+31.25
+29.00
+72.31
+62.99
+67.50
+49.73
+ViT[46]
+ICLR’21
+61.54
+53.54
+43.13
+40.11
+82.14
+71.34
+80.00
+64.47
+PCL-CLIP[47]
+CoRR’23
+67.31
+60.93
+54.37
+51.43
+84.82
+76.00
+70.00
+60.75
+CLIP-ReID[48]
+AAAI’23
+68.27
+64.25
+55.62
+53.83
+84.82
+80.80
+75.00
+65.42
+VDT[19]
+CVPR’24
+64.10
+55.20
+48.12
+42.76
+82.14
+71.59
+82.50
+66.83
+DTST[24]
+ICME’25
+64.42
+55.73
+50.63
+43.39
+78.57
+72.40
+80.00
+63.31
+SeCap[21]
+CVPR’25
+68.59
+60.19
+69.43
+58.94
+86.61
+75.42
+80.00
+68.08
+ViSA
+-
+70.51
+65.46
+71.28
+69.00
+88.39
+83.90
+82.50
+67.78
+where vi and ˆvi represent the ground-truth and predicted
+view labels, respectively. To disentangle identity and view-
+point representations more effectively, we impose an ex-
+plicit orthogonality constraint between the invariant feature
+f inv
+i
+and the view feature f spe
+i
+:
+Lo =
+1
+|B|
+|B|
+X
+i=1
+cos(f inv
+i
+, f spe
+i
+)
+ .
+(17)
+MoE Load-Balancing Loss. For the ETGM, we adopt a
+load-balancing regularization to prevent expert collapse and
+encourage diverse expert participation:
+Lbalance = E
+E
+X
+j=1
+¯p2
+j,
+(18)
+¯pj =
+1
+|B|
+|B|
+X
+i=1
+pfi,j,
+(19)
+where E represents the number of experts and pfi,j denotes
+the routing probability of the j-th expert for instance i. Min-
+imizing this term promotes uniform expert utilization and
+stabilizes MoE training.
+Overall Objective.
+The total optimization objective of
+ViSA can be formally written as:
+L = (Lglobal
+id
++ Lglobal
+tri
+)
++ (Llocal
+id
++ Llocal
+tri )
+(20)
++ Lo + Lview + λLbalance,
+where λ is a weighting hyperparameter to balance the MoE
+load balancing and ReID objectives.
+4. Experiment
+4.1. Experiment Settings
+Datasets. We conduct extensive evaluations on three repre-
+sentative AGPReID benchmarks, including two real-world
+datasets and one synthetic dataset: AG-ReID.v2 [17], LAG-
+PeR [21] and CARGO [19]. AG-ReID.v2 is a large-scale
+real-world dataset specifically designed for person Re-ID
+in mixed aerial–ground scenarios.
+It comprises 100,502
+images of 1,615 unique identities, each annotated with 15
+soft attribute labels. The data were collected from multiple
+sensing platforms, including UAVs, stationary CCTVs, and
+smart glasses–integrated cameras, covering diverse view-
+ing angles and motion patterns. CARGO is a large-scale
+synthetic dataset comprising 108,563 person images from
+5,000 identities, captured by eight ground and five aerial
+cameras, providing a controlled setting with diverse cross-
+view variations. LAGPeR contains 63,841 images cover-
+ing 4,231 identities acquired by fourteen ground and seven
+aerial cameras, with drone altitudes between 20 m and 60
+m, providing richer spatial diversity.
+Evaluation Metrics. Following previous works, we adopt
+the cumulative matching characteristic (CMC) at Rank-1
+(R1) and the mean Average Precision (mAP) as evaluation
+metrics. These complementary metrics jointly measure re-
+trieval precision and ranking accuracy, providing a holistic
+evaluation of cross-view person retrieval performance.
+Implementation Details. All experiments are conducted
+on a single NVIDIA RTX 4090 GPU. We adopt the Vi-
+sion Transformer (ViT) backbone [49], pre-trained on Im-
+
+PAGE 7
+Table 2. The efficacy of components in ViSA is evaluated on the CARGO dataset. VAB represents using the view aware backbone. The
+best results are highlighted in bold.
+VAB
+ETGM
+DLFM
+ALL
+A↔G
+G↔G
+A↔A
+Average
+Rank-1
+mAP
+Rank-1
+mAP
+Rank-1
+mAP
+Rank-1
+mAP
+Rank-1
+mAP
+Baseline (ViT)
+61.54
+53.54
+43.13
+40.11
+82.14
+71.34
+80.00
+64.47
+66.70
+57.37
+✓
+64.10
+55.20
+48.12
+42.76
+82.14
+71.59
+82.50
+66.83
+69.22
+59.10
+✓
+67.31
+62.86
+65.96
+66.72
+86.61
+81.85
+80.00
+66.44
+74.97
+69.47
+✓
+✓
+68.59
+62.40
+68.09
+65.53
+84.82
+80.80
+80.00
+64.87
+75.38
+68.43
+✓
+✓
+69.55
+64.06
+69.15
+66.59
+83.04
+80.85
+75.00
+65.18
+74.19
+69.17
+✓
+✓
+✓
+70.51
+65.46
+71.28
+69.00
+88.39
+83.90
+82.50
+67.78
+78.17
+71.54
+ageNet [50], as the feature encoder. Input images are uni-
+formly resized to 256 × 128. During training, each mini-
+batch contains 256 samples, composed of 64 identities with
+4 instances per identity. The model is optimized for 120
+epochs using Stochastic Gradient Descent (SGD) [51] with
+momentum, starting from an initial learning rate of 8×10−3
+and decayed to 1.6 × 10−6 following a cosine annealing
+schedule. For the ETGM, we adopt a mixture-of-experts ar-
+chitecture containing 8 experts for each type (view-invariant
+and view-specific). The router dynamically selects the top-
+2 most relevant experts for each input sample based on the
+learned gating weights, enabling adaptive feature special-
+ization while maintaining overall training stability through
+load-balancing regularization.
+4.2. Performance
+Tab. 1 report ViSA’s performance on CARGO datasets.
+ViSA achieves 70.51% Rank-1 and 65.46% mAP under
+the ALL protocol, outperforming the previous best method
+by +1.92% Rank-1 and +5.27% mAP. Notably, ViSA also
+shows substantial improvements in the A↔G protocol,
+achieving 71.28% Rank-1 and 69.00% mAP, which demon-
+strates its effectiveness in bridging the extreme viewpoint
+gap between aerial and ground cameras. These gains indi-
+cate that our expert-driven disentanglement, combined with
+query-guided local graph fusion, not only enhances global
+cross-view representations but also effectively exploits fine-
+grained patch-level cues, enabling more robust and discrim-
+inative identity modeling across heterogeneous views.
+Performance on other datasets are shown in the sup-
+plementary material. On AG-ReID.v2, ViSA achieves the
+highest mAP across all four evaluation protocols and al-
+most the best Rank-1 accuracy, demonstrating consistent
+improvements over ViT [46] and recent AGPReID methods
+including VDT [19], V2E [17], and SeCap [21].
+On LAGPeR, ViSA achieves the best mAP under all
+three protocols and ranks first or second for Rank-1, fur-
+ther confirming the effectiveness of expert-driven disentan-
+glement and local graph-based fusion in capturing comple-
+mentary identity cues across heterogeneous views. Addi-
+tional results and comparisons are provided in the supple-
+mentary material, demonstrating consistent state-of-the-art
+performance across diverse aerial-ground settings.
+Overall, ViSA sets a new state-of-the-art on standard
+AGPReID benchmarks, demonstrating that view-aware se-
+mantic alignment provides a powerful and general paradigm
+for capturing both shared and view-specific identity cues in
+cross-view person re-identification.
+4.3. Ablation Study
+We conduct extensive ablation studies on the CARGO
+dataset to evaluate the contribution of each component in
+ViSA, including the View-Aware Backbone (VAB), Expert-
+driven Token Generation Module (ETGM), and Dual-
+branch Local Fusion Module (DLFM). The results are sum-
+marized in Tab. 2. From the results, several observations
+can be made.
+(1) Adding DLFM alone to the baseline
+significantly improves performance (ALL Rank-1: 61.54%
+→67.31%, mAP: 53.54% →62.86%), demonstrating the
+importance of capturing structural and semantic relations
+among local patch features. By explicitly modeling local
+interactions through graph convolution and top-k neighbor-
+hood selection, DLFM effectively exploits distributed iden-
+tity information and enhances discriminability. (2) Remov-
+ing ETGM results in lower performance (A↔G Rank-1:
+71.28% →68.09%) since the model lacks a mechanism to
+explicitly separate identity cues from viewpoint-dependent
+variations, which is particularly important in cross-view
+scenarios. (3) Equipping the model with the VAB further
+boosts results, especially in challenging cross-view settings.
+Overall, combining all three components achieves the
+best performance, highlighting the complementary roles
+of view-aware mechanism, semantic-guided expert queries,
+and structured local fusion.
+
+PAGE 8
+(a) The effect of E
+(b) The effect of k
+(c) The effect of λ
+Figure 4. Analysis of hyper-parameters under ‘ALL’ protocol on the CARGO dataset. Rank-1 and mAP and their average are reported (%).
+E represents the number of experts. k represents number of selected experts. For further comparison on other protocols, please refer to the
+supplementary material.
+4.4. Parameter Analysis
+We further conduct a detailed parameter analysis to investi-
+gate the impact of key hyperparameters in our ViSA frame-
+work, including the number of experts E, the number of
+selected experts k, and the balancing coefficient λ. Results
+are illustrated in Fig. 4. We vary the number of experts in
+the ETGM from 1 to 9. As shown in Fig. 4(a), the over-
+all performance initially increases with more experts and
+reaches the best result when E is set to 8. This indicates
+that introducing multiple experts allows the model to bet-
+ter capture diverse viewpoint-specific patterns. However,
+an excessive number of experts slightly degrades perfor-
+mance, likely due to redundancy and increased competition
+among experts. We then analyze the effect of selecting dif-
+ferent numbers of active experts during routing. As shown
+in Fig. 4(b), the best performance is achieved when two ex-
+perts are activated per sample. Activating a single expert
+limits the model’s representational capacity, while selecting
+too many experts (e.g., more than 3) dilutes expert special-
+ization and introduces noisy feature aggregation. Finally,
+we analyze the influence of the coefficient λ, which controls
+the weight of the load-balancing loss in the MoE routing
+process. As shown in Fig. 4(c), setting λ = 0.001 achieves
+the best performance. A small balancing strength encour-
+ages sufficient diversity among experts while maintaining
+focus on discriminative learning. Conversely, a large λ en-
+forces overly uniform expert utilization, suppressing spe-
+cialization and leading to degraded retrieval accuracy.
+4.5. Visualization Analysis
+To further validate the effectiveness of the view-aware se-
+mantic alignment strategy, we conducted a retrieval visu-
+alization analysis on the AG-ReID.v2 dataset under A→G
+protocol (Fig. 5). Unlike the baseline, ViSA consistently
+matches identities across viewpoints, suggesting that the
+proposed view-aware alignment mitigates local alignment
+degradation and achieves semantic-level consistency.
+Query
+Rank1      Rank5 (Baseline)
+Rank1
+Rank5 (Ours)
+Figure 5. Comparison of several retrieval visualizations on AG-
+ReID.v2 dataset under A→G protocol. Red and green boxes rep-
+resent wrong and correct matchings, respectively.
+5. Conclusion
+In this work, we focus on the challenging problem of AG-
+PReID and highlight that existing view-invariant paradigms
+may collapse into part-level alignment, thereby failing
+to fully exploit discriminative identity cues tied to view-
+point variations. To tackle this issue, we propose a view-
+aware semantic alignment framework named ViSA that
+achieves consistent cross-view perception by constructing
+adaptive viewpoint-specific experts and aligning their re-
+sponsive local regions through graph reasoning.
+Exten-
+sive experiments on AG-ReID.v2, CARGO, and LAGPeR
+demonstrate that ViSA consistently surpasses state-of-the-
+art methods, achieving up to a 10.06% mAP improvement
+under the challenging cross-view protocol. These results
+verify the effectiveness of jointly modeling view-invariant
+and view-specific cues for robust aerial-ground person re-
+identification.
+
+PAGE 9
+Acknowledgments
+This work was supported by the National Natural Sci-
+ence Foundation of China (U22A2095, 62506393), the
+Project of Guangdong Provincial Key Laboratory of In-
+formation Security Technology (2023B1212060026), the
+Guangdong Basic and Applied Basic Research Founda-
+tion (2026A1515011438), and the Postdoctoral Fellowship
+Program and the China Postdoctoral Science Foundation
+(GZC20252314).
+References
+[1] Quan Zhang, Jianhuang Lai, Xiaohua Xie, Xiaofeng Jin, and
+Sien Huang. Separable spatial-temporal residual graph for
+cloth-changing group re-identification. IEEE TPAMI, 46(8):
+5791–5805, 2024. 1
+[2] Yuhao Wang, Yongfeng Lv, Pingping Zhang, and Huchuan
+Lu. Idea: Inverted text with cooperative deformable aggrega-
+tion for multi-modal object re-identification. In CVPR, pages
+29701–29710, 2025.
+[3] Quan Zhang, Jianhuang Lai, Zhanxiang Feng, and Xiaohua
+Xie. Uncertainty modeling for group re-identification. IJCV,
+132(8):3046–3066, 2024.
+[4] Xuehu Liu, Pingping Zhang, and Huchuan Lu. Video-based
+person re-identification with long short-term representation
+learning. In ICIG, pages 55–67, 2023.
+[5] Quan Zhang, Jianhuang Lai, Zhanxiang Feng, and Xiao-
+hua Xie. Seeing like a human: Asynchronous learning with
+dynamic progressive refinement for person re-identification.
+IEEE TIP, 31:352–365, 2021.
+[6] Hu Lu, Xuezhang Zou, and Pingping Zhang. Learning pro-
+gressive modality-shared transformers for effective visible-
+infrared person re-identification. In AAAI, pages 1835–1843,
+2023.
+[7] Quan Zhang, Kaiheng Dang, Jian-Huang Lai, Zhanxiang
+Feng, and Xiaohua Xie. Modeling 3d layout for group re-
+identification. In CVPR, pages 7512–7520, 2022.
+[8] Jiangming Shi, Xiangbo Yin, Yeyun Chen, Yachao Zhang,
+Zhizhong Zhang, Yuan Xie, and Yanyun Qu.
+Multi-
+memory matching for unsupervised visible-infrared person
+re-identification. In ECCV, pages 456–474. Springer, 2024.
+[9] Shang Gao, Chenyang Yu, Pingping Zhang, and Huchuan
+Lu. Part representation learning with teacher-student decoder
+for occluded person re-identification.
+In ICASSP, pages
+2660–2664, 2024.
+[10] Yao Peng, Yining Lin, Huajian Ni, Hua Gao, and Chenchen
+Hu. A feature enhancement loss for person re-identification.
+Systems Science & Control Engineering, 11(1):2220482,
+2023.
+[11] Quan Zhang, Jianhuang Lai, and Xiaohua Xie.
+Learning
+modal-invariant angular metric by cyclic projection network
+for vis-nir person re-identification.
+IEEE TIP, 30:8019–
+8033, 2021.
+[12] Liyao Han, Jiajia Liu, and Yanning Zhang. Dp-gan: A novel
+generative adversarial network-based drone pilot identifica-
+tion scheme. IEEE Sensors Journal, 23(24):31537–31548,
+2023.
+[13] Guowen Zhang, Pingping Zhang, Jinqing Qi, and Huchuan
+Lu. Hat: Hierarchical aggregation transformers for person
+re-identification. In ACM MM, pages 516–525, 2021.
+[14] Bingliang Jiao, Lingqiao Liu, Liying Gao, Ruiqi Wu, Gu-
+osheng Lin, PENG WANG, and Yanning Zhang.
+Toward
+re-identifying any animal. In NeurIPS, pages 40042–40053.
+Curran Associates, Inc., 2023. 1
+[15] Huy Nguyen, Khanh Nguyen, Sridha Sridharan, and Clinton
+Fookes. Aerial-ground person re-id. In ICME, pages 2585–
+2590, 2023. 1, 2
+[16] Shizhou Zhang, Qi Zhang, Yifei Yang, Xing Wei, Peng
+Wang, Bingliang Jiao, and Yanning Zhang.
+Person re-
+identification in aerial imagery. IEEE TMM, 23:281–291,
+2020.
+[17] Huy Nguyen, Kien Nguyen, Sridha Sridharan, and Clinton
+Fookes. Ag-reid.v2: Bridging aerial and ground views for
+person re-identification. IEEE Transactions on Information
+Forensics and Security, 19:2896–2908, 2024. 2, 6, 7
+[18] Shizhou Zhang, Qingchun Yang, De Cheng, Yinghui Xing,
+Guoqiang Liang, Peng Wang, and Yanning Zhang. Ground-
+to-aerial person search: Benchmark dataset and approach. In
+ACM MM, pages 789–799, 2023. 1
+[19] Quan Zhang, Lei Wang, Vishal M Patel, Xiaohua Xie, and
+Jianhaung Lai. View-decoupled transformer for person re-
+identification under aerial-ground camera network. In CVPR,
+pages 22000–22009, 2024. 1, 2, 4, 6, 7
+[20] Xiaoxiao Sun and Liang Zheng.
+Dissecting person re-
+identification from the viewpoint of viewpoint. In CVPR,
+pages 608–617, 2019.
+[21] Shiqi Wang, Yifan Wang, Rui Wu, et al.
+Secap: Self-
+calibrating and adaptive prompts for cross-view person re-
+identification in aerial-ground networks. In CVPR, 2025. 2,
+6, 7
+[22] Wajahat Khalid, Bin Liu, Xulin Li, Muhammad Waqas, and
+Muhammad Sher Afgan. Bridging the sky and ground: To-
+wards view-invariant feature learning for aerial-ground per-
+son re-identification. In ICCV, pages 9749–9758, 2025. 1,
+2
+[23] Pingping Zhang, Xiang Hu, Yuhao Wang, and Huchuan Lu.
+Latex: Leveraging attribute-based text knowledge for aerial-
+ground person re-identification. 2025. 2
+[24] Yuhai Wang and Maryam Pishgar. Dynamic token selection
+for aerial-ground person re-identification. In ICME, 2025. 2,
+6
+[25] Robert A Jacobs, Michael I Jordan, Steven J Nowlan, and
+Geoffrey E Hinton. Adaptive mixtures of local experts. Neu-
+ral computation, 3(1):79–87, 1991. 2
+[26] Michael I Jordan and Robert A Jacobs. Hierarchical mixtures
+of experts and the em algorithm. Neural computation, 6(2):
+181–214, 1994. 2
+[27] Changho Hwang, Wei Cui, Yifan Xiong, Ziyue Yang, Ze
+Liu, Han Hu, Zilong Wang, Rafael Salas, Jithin Jose, Prab-
+hat Ram, et al. Tutel: Adaptive mixture-of-experts at scale.
+Proceedings of Machine Learning and Systems, 5:269–287,
+2023. 2
+[28] Carlos Riquelme, Joan Puigcerver, Basil Mustafa, Maxim
+Neumann, Rodolphe Jenatton, Andr´e Susano Pinto, Daniel
+
+PAGE 10
+Keysers, and Neil Houlsby. Scaling vision with sparse mix-
+ture of experts. In NeurIPS, pages 8583–8595, 2021.
+[29] Mohammed Nowaz Rabbani Chowdhury, Shuai Zhang,
+Meng Wang, Sijia Liu, and Pin-Yu Chen. Patch-level routing
+in mixture-of-experts is provably sample-efficient for con-
+volutional neural networks.
+In ICML, pages 6074–6114.
+PMLR, 2023. 2
+[30] Shaoxiang Chen, Zequn Jie, and Lin Ma.
+Llava-mole:
+Sparse mixture of lora experts for mitigating data con-
+flicts in instruction finetuning mllms.
+arXiv preprint
+arXiv:2401.16160, 2024. 2
+[31] Zeren Chen, Ziqin Wang, Zhen Wang, Huayang Liu, Zhenfei
+Yin, Si Liu, Lu Sheng, Wanli Ouyang, Yu Qiao, and Jing
+Shao. Octavius: Mitigating task interference in mllms via
+moe, 2023.
+[32] Basil Mustafa, Carlos Riquelme, Joan Puigcerver, Rodolphe
+Jenatton, and Neil Houlsby. Multimodal contrastive learn-
+ing with limoe:
+the language-image mixture of experts.
+NeurIPS, 35:9564–9576, 2022. 2
+[33] Kai Ren, Chuanping Hu, Hao Xi, Yongqiang Li, Jinhao Fan,
+and Lihua Liu. Mosce-reid: Mixture of semantic clustering
+experts for person re-identification. Neurocomputing, 626:
+129587, 2025. 2
+[34] Yiyang Su, Yunping Shi, Feng Liu, and Xiaoming Liu.
+Hamobe: Hierarchical and adaptive mixture of biometric ex-
+perts for video-based person reid. In ICCV, pages 11525–
+11536, 2025. 2
+[35] Yuhao Wang, Yang Liu, Aihua Zheng, and Pingping Zhang.
+Demo:
+Decoupled feature-based mixture of experts for
+multi-modal object re-identification.
+AAAI, 39(8):8141–
+8149, 2025. 2
+[36] Yang Wang, Yixing Zhang, Xudie Ren, and Yuxin Deng.
+Moda: Mixture of domain adapters for parameter-efficient
+generalizable person re-identification. ACM Transactions on
+Multimedia Computing, Communications and Applications,
+21(5):1–19, 2025. 2
+[37] Binh X Nguyen, Binh D Nguyen, Tuong Do, Erman Tjiputra,
+Quang D Tran, and Anh Nguyen. Graph-based person sig-
+nature for person re-identifications. In CVPR, pages 3492–
+3501, 2021. 3
+[38] Guan’an Wang, Shuo Yang, Huanyu Liu, Zhicheng Wang,
+Yang Yang, Shuliang Wang, Gang Yu, Erjin Zhou, and Jian
+Sun. High-order information matters: Learning relation and
+topology for occluded person re-identification.
+In CVPR,
+pages 6449–6458, 2020. 3
+[39] Meiyan Huang,
+Chunping Hou,
+Qingyuan Yang,
+and
+Zhipeng Wang. Reasoning and tuning: Graph attention net-
+work for occluded person re-identification. IEEE TIP, 32:
+1568–1582, 2023. 3
+[40] Guanshuo Wang, Yufeng Yuan, Xiong Chen, Jiwei Li, and Xi
+Zhou. Learning discriminative features with multiple granu-
+larities for person re-identification. ACM MM, 2018. 6, 2
+[41] Hao Luo, Youzhi Gu, Xingyu Liao, Shenqi Lai, and Wei
+Jiang. Bag of tricks and a strong baseline for deep person
+re-identification. In CVPR, pages 0–0, 2019. 6, 2
+[42] Ratnesh
+Kumar,
+Edwin
+Weill,
+Farzin
+Aghdasi,
+and
+Parthasarathy Sriram. A strong and efficient baseline for ve-
+hicle re-identification using deep triplet embedding. Journal
+of Artificial Intelligence and Soft Computing Research, 10
+(1):27–45, 2020. 6
+[43] Y. Sun, L. Zheng, Y. Li, Y. Yang, Q. Tian, and S. Wang.
+Learning part-based convolutional features for person re-
+identification. IEEE TPAMI, 43(3):902–917, 2021. 6
+[44] Mang Ye, Jianbing Shen, Gaojie Lin, Tao Xiang, Ling
+Shao, and Steven CH Hoi.
+Deep learning for person re-
+identification: A survey and outlook. IEEE TPAMI, 44(6):
+2872–2893, 2021. 6
+[45] Lingxiao He, Xingyu Liao, Wu Liu, Xinchen Liu, Peng
+Cheng, and Tao Mei. Fastreid: A pytorch toolbox for general
+instance re-identification. In ACM MM, pages 9664–9667,
+2023. 6, 2
+[46] Alexey Dosovitskiy, Lucas Beyer, Alexander Kolesnikov,
+Dirk Weissenborn, Xiaohua Zhai, Thomas Unterthiner,
+Mostafa Dehghani, Matthias Minderer, Georg Heigold, Syl-
+vain Gelly, et al. An image is worth 16x16 words: Trans-
+formers for image recognition at scale. In ICLR, 2021. 6, 7,
+2
+[47] Jiachen Li and Xiaojin Gong.
+Prototypical contrastive
+learning-based clip fine-tuning for object re-identification.
+CoRR, 2023. 6, 2
+[48] Siyuan Li, Li Sun, and Qingli Li.
+Clip-reid: exploiting
+vision-language model for image re-identification without
+concrete text labels. In AAAI, pages 1405–1413, 2023. 6,
+2
+[49] Ze Liu, Yutong Lin, Yue Cao, Han Hu, Yixuan Wei, Zheng
+Zhang, Stephen Lin, and Baining Guo. Swin transformer:
+Hierarchical vision transformer using shifted windows. In
+ICCV, pages 10012–10022, 2021. 6, 2
+[50] Jia Deng, Wei Dong, Richard Socher, Li-Jia Li, Kai Li,
+and Li Fei-Fei. Imagenet: A large-scale hierarchical image
+database. In CVPR, pages 248–255. Ieee, 2009. 7
+[51] L´eon Bottou. Large-scale machine learning with stochastic
+gradient descent. In ICCS, pages 177–186. Springer, 2010.
+7
+[52] Jingdong Wang, Ke Sun, Tianheng Cheng, Borui Jiang,
+Chaorui Deng, Yang Zhao, Dong Liu, Yadong Mu, Mingkui
+Tan, Xinggang Wang, et al. Deep high-resolution represen-
+tation learning for visual recognition. IEEE TPAMI, 43(10):
+3349–3364, 2020. 2
+[53] Ze Liu, Han Hu, Yutong Lin, Zhuliang Yao, Zhenda Xie,
+Yixuan Wei, Jia Ning, Yue Cao, Zheng Zhang, Li Dong, et al.
+Swin transformer v2: Scaling up capacity and resolution. In
+CVPR, pages 12009–12019, 2022. 2
+[54] Shuting He, Hao Luo, Pichao Wang, Fan Wang, Hao Li,
+and Wei Jiang.
+Transreid: Transformer-based object re-
+identification. In ICCV, pages 15013–15022, 2021. 2
+[55] Yuhao Wang, Pingping Zhang, Xuehu Liu, Zhengzheng Tu,
+and Huchuan Lu. Unity is strength: Unifying convolutional
+and transformeral features for better person re-identification.
+IEEE Transactions on Intelligent Transportation Systems,
+2025. 2
+[56] Ruiqi Wu, Bingliang Jiao, Wenxuan Wang, Meng Liu,
+and Peng Wang.
+Enhancing visible-infrared person
+re-identification with modality-and instance-aware visual
+prompt learning. In ICMR, pages 579–588, 2024. 2
+
+PAGE 11
+View-Aware Semantic Alignment for Aerial-Ground Person Re-Identification
+Supplementary Material
+In this supplementary material, we provide additional
+analyses and results to further evaluate our proposed ViSA.
+Specifically, we first present extended qualitative visualiza-
+tions, including additional retrieval examples on CARGO
+and t-SNE comparisons.
+We then report comprehensive
+quantitative results by providing full performance tables on
+AG-ReID.v2 and LAGPeR under all evaluation settings. Fi-
+nally, we conduct detailed hyperparameter analyses, exam-
+ining the effects of the number of experts, the number of
+selected experts, and the balancing coefficient across differ-
+ent cross-view protocols.
+6. Visual Analysis
+6.1. Retrieval Visualization
+In addition to the retrieval visualization on the AG-ReID.v2
+dataset shown in Fig. 5, we further provide retrieval exam-
+ples on the CARGO dataset under both the A↔G protocol
+and the ALL protocol. As illustrated in Fig. 6, our method
+consistently retrieves correct cross-view matches across dif-
+ferent evaluation settings, demonstrating strong robustness
+and generalization. These results further verify the effec-
+tiveness of our approach in handling diverse viewpoint tran-
+sitions across datasets and protocols.
+6.2. Feature Visualization
+To further investigate the effectiveness of ViSA in cross-
+view representation learning, we visualize the learned em-
+beddings using t-SNE. As shown in Fig. 7, we compare the
+feature distributions of the baseline model and ViSA. The
+reduced discrepancy between ground and aerial features in-
+dicates that ViSA effectively mitigates cross-view domain
+gaps and learns more discriminative, view-invariant repre-
+sentations.
+7. Performance
+Tab. 3 and Tab. 4 report the performance of ViSA on
+AG-ReID.v2 and LAGPeR, respectively. On AG-ReID.v2,
+ViSA achieves the highest mAP across all methods and sets
+a new state of the art in every evaluation setting except
+the A→W protocol, where the viewpoint variation is rela-
+tively minor. We further observe that in this less challenging
+A→W scenario, methods such as Explain and V2E obtain
+slightly better results, largely benefiting from the use of at-
+tribute annotations. When compared only with approaches
+that do not rely on attribute labels, ViSA still delivers the
+best performance. On the LAGPeR dataset, ViSA achieves
+improvements of up to 1.0% in mAP and 1.22% in Rank-
+Figure 6.
+Comparison of several retrieval visualizations on
+CARGO dataset under A→G protocol and ALL protocol. Red
+and green boxes represent wrong and correct matchings, respec-
+tively. The top five retrieved results are shown.
+Figure 7. t-SNE visualization. Left: Baseline. Right: ViSA.
+Colors indicate different classes and shapes denote different views.
+1 accuracy, demonstrating its strong generalization ability
+under larger cross-view variations.
+8. Parameter Analysis
+We further analyze the impact of hyperparameters under
+different evaluation protocols. In the study of the number
+of experts E, we fix the number of selected expert to 1 (set-
+ting k = 1) to ensure controlled comparisons. As shown in
+
+PAGE 12
+Table 3. Performance comparison on AG-ReID.v2 dataset. C represents CCTV, W represents wearable devices and A represents aerial
+views. The best and second-best results are highlighted in bold and underline, respectively.
+Method
+Venue
+A→C
+A→W
+C→A
+W→A
+Rank-1
+mAP
+Rank-1
+mAP
+Rank-1
+mAP
+Rank-1
+mAP
+Swin [49]
+ICCV’21
+68.76
+57.66
+68.49
+56.15
+68.80
+57.70
+64.40
+53.90
+HRNet-18 [52]
+PAMI’20
+75.21
+65.07
+76.26
+66.17
+76.25
+66.16
+76.25
+66.17
+SwinV2 [53]
+CVPR’22
+76.44
+66.09
+80.08
+69.09
+77.11
+62.14
+74.53
+65.61
+MGN(R50) [40]
+ACM MM’18
+82.09
+70.17
+88.14
+78.66
+84.21
+72.41
+84.06
+73.73
+BoT(R50) [41]
+CVPR’19
+80.73
+71.49
+86.06
+75.98
+79.46
+69.67
+82.69
+72.41
+SBS(R50) [45]
+ACM MM’23
+81.96
+72.04
+88.14
+78.94
+84.10
+73.89
+84.66
+75.01
+BoT(ViT) [41]
+CVPR’19
+85.40
+77.03
+89.77
+80.48
+84.65
+75.90
+84.65
+75.90
+ViT [46]
+ICLR’21
+85.40
+77.03
+89.77
+80.48
+84.65
+75.90
+84.27
+76.59
+TransReID [54]
+ICCV’21
+88.00
+81.40
+90.40
+84.50
+87.60
+80.10
+87.70
+81.10
+FusionReID [55]
+T-ITS’25
+86.70
+80.70
+89.70
+84.20
+87.90
+80.00
+86.50
+80.90
+CLIP-ReID [48]
+AAAI’23
+85.36
+79.79
+89.14
+84.23
+85.64
+79.08
+86.50
+79.55
+PCL-CLIP [47]
+CoRR’23
+79.80
+72.20
+87.14
+77.70
+81.12
+72.40
+84.19
+73.89
+Explain [15]
+ICME’23
+87.70
+79.00
+93.67
+83.14
+87.35
+78.24
+87.73
+79.08
+VDT [19]
+CVPR’24
+86.46
+79.13
+90.00
+82.21
+86.14
+78.12
+85.26
+78.52
+V2E(ViT) [17]
+TIFS’24
+88.77
+80.72
+93.62
+84.85
+87.86
+78.51
+88.61
+80.11
+SeCap [21]
+CVPR’25
+88.12
+80.84
+91.44
+84.01
+88.24
+79.99
+87.56
+80.15
+ViSA
+-
+89.43
+83.61
+91.63
+85.99
+88.57
+82.32
+89.23
+83.10
+Table 4. Performance comparison on LAGPeR. The best and second-best results are highlighted in bold and underline, respectively.
+’A↔G’ denotes that the Aerial view is the query, ’G↔A’ denotes that the Ground view is the query, and ’G↔A+G’ indicates that the
+gallery contains images from both the Aerial and Ground view. CLIP-ReID∗indicates using OLP and SIE in Clip-ReID. MIP† represents
+the re-implementation for the AGPReID. Explain‡ indicates removing the attributes branch of the Explain method.
+Method
+Venue
+A↔G
+G↔A
+G↔A+G
+Average
+Rank-1
+mAP
+Rank-1
+mAP
+Rank-1
+mAP
+Rank-1
+mAP
+ViT [46]
+ICLR’21
+38.67
+27.25
+32.04
+30.69
+18.88
+15.31
+29.86
+24.42
+TransReID [54]
+ICCV’21
+38.80
+28.80
+33.00
+32.10
+22.90
+18.80
+31.57
+26.57
+CLIP-ReID [48]
+AAAI’23
+24.40
+17.60
+21.30
+20.80
+12.30
+10.20
+19.33
+16.20
+CLIP-ReID∗
+AAAI’23
+23.10
+17.50
+20.00
+20.30
+9.00
+8.40
+17.37
+15.40
+MIP† [56]
+ICMR’24
+39.30
+29.30
+33.90
+32.60
+21.00
+17.30
+31.40
+26.40
+Explain‡ [15]
+ICME’23
+40.48
+28.89
+32.96
+31.91
+22.03
+17.89
+31.82
+26.23
+VDT [19]
+CVPR’24
+40.15
+28.97
+33.55
+31.98
+19.50
+16.45
+31.07
+25.80
+SeCap [21]
+CVPR’25
+41.79
+30.37
+35.26
+33.42
+24.39
+19.24
+33.81
+27.68
+ViSA
+-
+41.37
+30.42
+35.06
+33.59
+25.61
+20.31
+34.01
+28.11
+Fig. 8a ∼Fig. 8c, the performance first increases and then
+decreases as E grows. Under the A↔G and G↔G proto-
+cols, the best results are achieved when E = 8, while un-
+der the A↔A protocol, the optimal performance is obtained
+with E = 7.
+Similarly, as shown in Fig. 8d ∼Fig. 8f when analyz-
+ing the number of selected experts k, we observe a clear
+rise-then-drop trend. The performance peaks at k = 2, in-
+dicating that activating a small but diverse subset of experts
+provides the best balance between specialization and gener-
+alization.
+For the balancing coefficient λ, we compare values
+{0.0001, 0.001, 0.01, 0.1, 1.0} across all protocols.
+As
+shown in Fig. 8g ∼Fig. 8i, setting λ = 0.001 consistently
+achieves the best performance on all three protocols, indi-
+cating that a moderate regularization strength is essential
+
+PAGE 13
+(a) E: A↔G
+(b) E: A↔A
+(c) E: G↔G
+(d) k: A↔G
+(e) k: A↔A
+(f) k: G↔G
+(g) λ: A↔G
+(h) λ: A↔A
+(i) λ: G↔G
+Figure 8. Analysis of E, k, and λ across different protocols on the CARGO dataset. Rank-1 and mAP and their average are reported (%).
+E represents the number of experts. k represents number of selected experts. λ represents the balancing coefficient.
+Table 5. Efficiency comparison under ALL protocol.
+Method
+mAP(↑)
+Params(↓)
+GFLOPs(↓)
+FPS(↑)
+SeCap
+58.94%
+130.88M
+38.81
+276.66
+ViSA
+69.00%
+271.77M
+37.53
+429.05
+Rel.
++10.06%
++107.6%
+-3.3%
++55.1%
+for maintaining stable expert utilization without suppress-
+ing discriminative specialization.
+9. Efficiency
+ViSA achieves strong accuracy and efficiency despite in-
+troducing additional parameters (+107.6%). As shown in
+Tab. 5, ViSA enhances mAP by 10.06% while reducing
+GFLOPs by 3.3% and increasing inference speed by 55.1%
+FPS.

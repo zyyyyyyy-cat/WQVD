@@ -1,0 +1,16 @@
+[
+  "tests/test_feature_aug.py::test_a1_amp_scores_stay_fp32",
+  "tests/test_feature_aug.py::test_a1_shapes_selection_and_detach[128]",
+  "tests/test_feature_aug.py::test_a1_shapes_selection_and_detach[1]",
+  "tests/test_feature_aug.py::test_a1_shapes_selection_and_detach[7]",
+  "tests/test_feature_aug.py::test_a2_initialization_gradient_and_patch_dependency",
+  "tests/test_feature_aug.py::test_baseline_matches_pre_edit_snapshot",
+  "tests/test_feature_aug.py::test_checkpoint_migration_and_rejections",
+  "tests/test_feature_aug.py::test_full_resume_reproduces_next_update",
+  "tests/test_feature_aug.py::test_full_vit_training_losses_optimizer_and_inference[a1]",
+  "tests/test_feature_aug.py::test_full_vit_training_losses_optimizer_and_inference[a2]",
+  "tests/test_feature_aug.py::test_full_vit_training_losses_optimizer_and_inference[none]",
+  "tests/test_feature_aug.py::test_imagenet_interpolation_and_missing_keys",
+  "tests/test_feature_aug.py::test_main_and_local_identity_criterion_smoothing",
+  "tests/test_feature_aug.py::test_token_taps_are_exact_one_pass"
+]

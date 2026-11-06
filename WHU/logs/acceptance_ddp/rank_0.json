@@ -1,0 +1,34 @@
+{
+  "none": {
+    "losses": [
+      32.44173049926758,
+      3.8690075874328613
+    ],
+    "parameters_synchronized": true,
+    "prototypes_synchronized": true,
+    "uneven_eval": true
+  },
+  "a1": {
+    "losses": [
+      32.60185241699219,
+      3.4635379314422607
+    ],
+    "parameters_synchronized": true,
+    "prototypes_synchronized": true,
+    "uneven_eval": true
+  },
+  "a2": {
+    "losses": [
+      32.30336380004883,
+      3.210214853286743
+    ],
+    "parameters_synchronized": true,
+    "prototypes_synchronized": true,
+    "uneven_eval": true
+  },
+  "resume": {
+    "next_update_exact": true,
+    "rank_rng_exact": true,
+    "rank_buffers_exact": true
+  }
+}

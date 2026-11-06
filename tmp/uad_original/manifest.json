@@ -1,0 +1,15 @@
+{
+  "model/make_model.py": "042ca47867a114f56c5c9946ad08ec27c9c9265a42f4f57cd0f5a220105d9ba4",
+  "model/backbones/vit_pytorch.py": "e935f70335cd86617545e5afe8d4308638d71143c96960998e65d51ae08ef503",
+  "processor/processor.py": "3e368495ff0067d96647828ccd89aeed51069b13f8afd95035768e15ab6a1a28",
+  "config/defaults.py": "16d1f61a8a10f3d520e2a17ac444010f10c846597a5eaebf52fed90f588cf2f2",
+  "loss/make_loss.py": "91f872a9462c109a5d34a359eff7b4ada5f070f304516537c5a9bd66dbac8ff9",
+  "train.py": "d4fc7be88d9b7fbb61821ab251c89e1c34943430156bd3ebb1a918fa3cd238ce",
+  "test.py": "bc520944f8dd0635e7c997fe4da566da9e5ddc6739fe93261694f0b90c073ee2",
+  "configs/UAD.yml": "f2fb4f9a9605eb5acd73e847d74f4cb5793bb61bc5094e36540cee4d6f9393ae",
+  "datasets/make_dataloader.py": "a87f676371bb6adc1db3183b954935f7c395e9cf4f14b76a883c71a835b04b85",
+  "datasets/sampler.py": "0603afb91f2e1f688f14c0bf37c7b217082d0b7dafcf24adfbb358624bcee96f",
+  "datasets/sampler_ddp.py": "4f055d77b81507162387a096d0763c810ee21608f2a3ec1ad6e9be37f232b1d1",
+  "utils/metrics.py": "1c927c9427c01d1f5ad4b05c203f403dce8275fb01131a8c8be3e44c1ca5797d",
+  "solver/make_optimizer.py": "51a3f9f4584e5ed3d8a692f03949bb6ff40531911f8fef7dac4a4fae4c135d04"
+}

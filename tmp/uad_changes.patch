@@ -1,0 +1,1707 @@
+--- before/WHU/model/make_model.py
++++ after/WHU/model/make_model.py
+@@ -1,6 +1,8 @@
+ import torch
+ import torch.nn as nn
+ from .backbones.vit_pytorch import vit_base_in, vit_ics_lup
++from .modules import A1LocalEnhancement, A2FeatureModulation
++from utils.checkpoint import load_model_checkpoint
+ 
+ def weights_init_kaiming(m):
+     classname = m.__class__.__name__
+@@ -30,6 +32,11 @@
+         super(build_transformer, self).__init__()
+         model_path = cfg.MODEL.PRETRAIN_PATH
+         pretrain_choice = cfg.MODEL.PRETRAIN_CHOICE
++        self.feature_aug_type = cfg.MODEL.FEATURE_AUG.TYPE.lower()
++        if self.feature_aug_type not in ('none', 'a1', 'a2'):
++            raise ValueError('FEATURE_AUG.TYPE must be none, a1, or a2')
++        if pretrain_choice not in ('imagenet', 'uad_init', 'resume', 'none', 'self', 'finetune'):
++            raise ValueError('Unknown PRETRAIN_CHOICE: {}'.format(pretrain_choice))
+         self.cos_layer = cfg.MODEL.COS_LAYER
+         self.neck = cfg.MODEL.NECK
+         self.neck_feat = cfg.TEST.NECK_FEAT
+@@ -51,7 +58,7 @@
+                                                         drop_rate= cfg.MODEL.DROP_OUT,
+                                                         attn_drop_rate=cfg.MODEL.ATT_DROP_RATE)
+ 
+-        if pretrain_choice == 'imagenet':
++        if pretrain_choice == 'imagenet' and not cfg.SOLVER.RESUME:
+             self.base.load_param(model_path)
+             print('Loading pretrained model......from {}'.format(model_path))
+ 
+@@ -63,16 +70,61 @@
+         self.bottleneck = nn.BatchNorm1d(self.in_planes)
+         self.bottleneck.bias.requires_grad_(False)
+         self.bottleneck.apply(weights_init_kaiming)
++
++        aug = cfg.MODEL.FEATURE_AUG
++        if self.feature_aug_type == 'a1':
++            self.feature_aug = A1LocalEnhancement(
++                self.in_planes, aug.DIM, aug.NUM_QUERY, aug.TOPK,
++                aug.NUM_HEADS, aug.LOCAL_TAU, aug.GAMMA)
++            self.local_bottleneck = nn.BatchNorm1d(self.in_planes)
++            self.local_bottleneck.bias.requires_grad_(False)
++            self.local_bottleneck.apply(weights_init_kaiming)
++            self.local_classifier = nn.Linear(self.in_planes, num_classes, bias=False)
++            self.local_classifier.apply(weights_init_classifier)
++        elif self.feature_aug_type == 'a2':
++            self.feature_aug = A2FeatureModulation(
++                self.in_planes, aug.DIM, aug.NUM_QUERY, aug.NUM_HEADS,
++                aug.GAMMA, aug.MASK_OUT_INIT_STD)
++        self.checkpoint_metadata = {
++            'version': 1, 'type': self.feature_aug_type,
++            'backbone': cfg.MODEL.TRANSFORMER_TYPE, 'in_planes': self.in_planes,
++            'num_classes': num_classes,
++            'backbone_config': {
++                'train_size': list(cfg.INPUT.SIZE_TRAIN),
++                'test_size': list(cfg.INPUT.SIZE_TEST),
++                'stride_size': list(cfg.MODEL.STRIDE_SIZE),
++                'sie_camera': cfg.MODEL.SIE_CAMERA, 'sie_view': cfg.MODEL.SIE_VIEW,
++                'sie_coe': cfg.MODEL.SIE_COE,
++            },
++            'feature_aug': dict(aug) if self.feature_aug_type != 'none' else {},
++        }
++        if pretrain_choice in ('uad_init', 'finetune') and not cfg.SOLVER.RESUME:
++            load_model_checkpoint(self, model_path, mode='uad_init')
++        elif pretrain_choice == 'self' and not cfg.SOLVER.RESUME:
++            load_model_checkpoint(self, model_path, mode='eval')
++
++    def _extract_feature(self, x):
++        if self.feature_aug_type == 'none':
++            return self.base(x), None
++        cls, patches = self.base(
++            x, return_tokens='l11' if self.feature_aug_type == 'a1' else 'l12')
++        if self.feature_aug_type == 'a1':
++            return self.feature_aug(cls, patches)
++        return self.feature_aug(cls, patches), None
+         
+     def forward(self, x=None, label=None, camids=None, mode=0):
+         if mode==0:
+             x = torch.cat(list(x), dim=0)
+-            global_feat = self.base(x)
++            global_feat, local_feat = self._extract_feature(x)
+             feat = self.bottleneck(global_feat)
+             cls_score = self.classifier(feat)
+-            return cls_score, global_feat, feat
++            local_score = None
++            if self.feature_aug_type == 'a1':
++                local_score = self.local_classifier(self.local_bottleneck(local_feat))
++            return {'cls_score': cls_score, 'global_feat': global_feat,
++                    'bn_feat': feat, 'local_feat': local_feat, 'local_score': local_score}
+         else:
+-            global_feat = self.base(x)
++            global_feat, _ = self._extract_feature(x)
+             feat = self.bottleneck(global_feat)
+             if self.neck_feat == 'after':
+                 return feat
+@@ -81,18 +133,10 @@
+ 
+ 
+     def load_param(self, trained_path):
+-        param_dict = torch.load(trained_path)
+-        for i in param_dict:
+-            if 'classifier' in i:
+-                continue
+-            self.state_dict()[i.replace('module.', '')].copy_(param_dict[i])
+-        print('Loading pretrained model from {}'.format(trained_path))
++        return load_model_checkpoint(self, trained_path, mode='eval')
+ 
+     def load_param_finetune(self, model_path):
+-        param_dict = torch.load(model_path)
+-        for i in param_dict:
+-            self.state_dict()[i].copy_(param_dict[i])
+-        print('Loading pretrained model for finetuning from {}'.format(model_path))
++        return load_model_checkpoint(self, model_path, mode='uad_init')
+ 
+ 
+ __factory_T_type = {
+--- before/WHU/model/backbones/vit_pytorch.py
++++ after/WHU/model/backbones/vit_pytorch.py
+@@ -28,6 +28,8 @@
+ import torch.nn as nn
+ import torch.nn.functional as F
+ import collections.abc as container_abcs
++import logging
++from utils.checkpoint import clean_state_dict, read_checkpoint
+ 
+ 
+ # From PyTorch internals
+@@ -314,7 +316,11 @@
+         self.num_classes = num_classes
+         self.fc = nn.Linear(self.embed_dim, num_classes) if num_classes > 0 else nn.Identity()
+ 
+-    def forward_features(self, x, camera_id, modal_id, view_id):
++    def forward_features(self, x, camera_id, modal_id, view_id, return_tokens=None):
++        if return_tokens not in (None, 'l11', 'l12'):
++            raise ValueError('return_tokens must be None, l11, or l12')
++        if return_tokens is not None and len(self.blocks) != 12:
++            raise ValueError('A1/A2 token extraction requires the original 12-block ViT')
+         B = x.shape[0]
+         x = self.patch_embed(x)
+ 
+@@ -333,23 +339,26 @@
+ 
+         x = self.pos_drop(x)
+  
+-        for blk in self.blocks:
++        p11 = None
++        for i, blk in enumerate(self.blocks):
+             x = blk(x)
++            if return_tokens == 'l11' and i == 10:
++                p11 = x[:, 1:, :]
+ 
+         x = self.norm(x)
+ 
++        if return_tokens == 'l11':
++            return x[:, 0], p11
++        if return_tokens == 'l12':
++            return x[:, 0], x[:, 1:, :]
+         return x[:, 0]
+ 
+-    def forward(self, x, cam_label=None, modal_label=None, view_label=None):
+-        x = self.forward_features(x, cam_label, modal_label, view_label)
++    def forward(self, x, cam_label=None, modal_label=None, view_label=None, return_tokens=None):
++        x = self.forward_features(x, cam_label, modal_label, view_label, return_tokens)
+         return x
+ 
+     def load_param(self, model_path):
+-        try:
+-            param_dict = torch.load(model_path, map_location='cpu', weights_only=False)
+-        except TypeError:
+-            param_dict = torch.load(model_path, map_location='cpu')
+-        count=0
++        param_dict = read_checkpoint(model_path)
+         if 'model' in param_dict:
+             param_dict = param_dict['model']
+         if 'state_dict' in param_dict:
+@@ -360,15 +369,22 @@
+             newmodel = {}
+             for k, v in obj.items():
+                 if k.startswith("module."):
+-                    k = k.replace("module.", "")
++                    k = k[len("module."):]
+                 if not k.startswith("backbone."):
+                     continue
+-                old_k = k
+-                k = k.replace("backbone.", "")
++                k = k[len("backbone."):]
+                 newmodel[k] = v
+-                param_dict = newmodel
++            param_dict = newmodel
++        param_dict = clean_state_dict(param_dict)
++        current = self.state_dict()
++        converted, skipped, errors = {}, [], []
++        resized = False
+         for k, v in param_dict.items():
+-            if 'head' in k or 'dist' in k or 'pre_logits' in k:
++            if k.startswith(('head.', 'head_dist.', 'pre_logits.')) or k == 'dist_token':
++                skipped.append(k)
++                continue
++            if k not in current:
++                errors.append('unexpected key: ' + k)
+                 continue
+             if 'patch_embed.proj.weight' in k and len(v.shape) < 4:
+                 # For old models that I trained prior to conv based patchification
+@@ -376,17 +392,29 @@
+                 v = v.reshape(O, -1, H, W)
+             elif k == 'pos_embed' and v.shape != self.pos_embed.shape:
+                 # To resize pos embedding when using model at different size from pretrained weights
+-                if 'distilled' in model_path:
++                if 'distilled' in str(model_path):
+                     print('distill need to choose right cls token in the pth')
+                     v = torch.cat([v[:, 0:1], v[:, 2:]], dim=1)
+                 v = resize_pos_embed(v, self.pos_embed, self.patch_embed.num_y, self.patch_embed.num_x, self.hw_ratio)
+-            try:
+-                self.state_dict()[k].copy_(v)
+-                count +=1
+-            except:
+-                print('===========================ERROR=========================')
+-                print('shape do not match in k :{}: param_dict{} vs self.state_dict(){}'.format(k, v.shape, self.state_dict()[k].shape))
+-        print('Load %d / %d layers.'%(count,len(self.state_dict().keys())))
++                resized = True
++            if v.shape != current[k].shape:
++                if k.startswith('fc.'):
++                    skipped.append(k)
++                    continue
++                errors.append('{}: {} vs {}'.format(k, tuple(v.shape), tuple(current[k].shape)))
++            else:
++                converted[k] = v
++        # ImageNet has no camera embedding; its unused classification head is optional.
++        missing = set(current) - set(converted)
++        required_missing = missing - {k for k in current if k.startswith('fc.') or k == 'sie_embed'}
++        if required_missing or errors:
++            raise ValueError('Incomplete ImageNet backbone: missing={}, errors={}'.format(
++                sorted(required_missing), errors))
++        self.load_state_dict(converted, strict=False)
++        logging.getLogger('transreid').info(
++            'ImageNet load: %d/%d tensors, skipped=%s, allowed missing=%s, '
++            'position interpolation=%s, loaded keys=%s', len(converted), len(current),
++            skipped, sorted(missing), resized, sorted(converted))
+ 
+ 
+ def resize_pos_embed(posemb, posemb_new, hight, width, hw_ratio=1):
+--- before/WHU/processor/processor.py
++++ after/WHU/processor/processor.py
+@@ -8,6 +8,7 @@
+ from torch.cuda import amp
+ import torch.distributed as dist
+ import torch.nn.functional as F
++from utils.checkpoint import restore_training_checkpoint, save_training_checkpoint, write_model_metadata
+ 
+ 
+ def PCA(feat, target, num_modalities, group_size=4):
+@@ -161,11 +162,21 @@
+         )
+ 
+     group_size = cfg.DATALOADER.NUM_INSTANCE
+-
+-    for epoch in range(1, epochs + 1):
++    local_ce_meter = AverageMeter()
++    start_epoch = 1
++    if cfg.SOLVER.RESUME:
++        start_epoch = restore_training_checkpoint(
++            cfg.SOLVER.RESUME, model_meta, cfg, optimizer, optimizer_center,
++            scheduler, scaler, proto_bank if use_aux_modules else None,
++            center_criterion, train_loader) + 1
++        if is_main:
++            logger.info('Resumed full training state; next epoch: {}'.format(start_epoch))
++
++    for epoch in range(start_epoch, epochs + 1):
+         start_time = time.time()
+         loss_meter.reset()
+         acc_meter.reset()
++        local_ce_meter.reset()
+         for m in meter_ls:
+             m.reset()
+         evaluator.reset()
+@@ -185,7 +196,9 @@
+             target_rep = target.repeat(num_modalities)
+ 
+             with amp.autocast(enabled=True):
+-                cls_score, global_feat, feat = model(imgs, target, camids)
++                output = model(imgs, target, camids)
++                cls_score = output['cls_score']
++                global_feat = output['global_feat']
+ 
+                 loss, il, tl = loss_fn(cls_score, global_feat, target_rep)
+                 meter_ls[0].update(il.item(), target_rep.shape[0])
+@@ -215,6 +228,11 @@
+                         loss += loss_pca * cfg.MODEL.PCA_LOSS_WEIGHT
+                     if 'gpd' in loss_type:
+                         loss += loss_gpd
++
++                if cfg.MODEL.FEATURE_AUG.TYPE.lower() == 'a1':
++                    local_ce = loss_fn.id_criterion(output['local_score'], target_rep)
++                    loss = loss + cfg.MODEL.FEATURE_AUG.LOCAL_CE_WEIGHT * local_ce
++                    local_ce_meter.update(local_ce.item(), target_rep.shape[0])
+ 
+             scaler.scale(loss).backward()
+             scaler.unscale_(optimizer)
+@@ -246,6 +264,9 @@
+                 metrics = [f'{m.avg:.3f}' for m in meter_ls]
+                 metrics_str = ', '.join(metrics)
+                 logger.info(f'Epoch[{epoch}] {metrics_str}')
++                if cfg.MODEL.FEATURE_AUG.TYPE.lower() == 'a1':
++                    logger.info('Local CE: {:.4f}; weight: {}'.format(
++                        local_ce_meter.avg, cfg.MODEL.FEATURE_AUG.LOCAL_CE_WEIGHT))
+ 
+         end_time = time.time()
+         time_per_batch = (end_time - start_time) / (n_iter + 1)
+@@ -272,6 +293,9 @@
+                         cfg.OUTPUT_DIR, cfg.MODEL.NAME + '_{}.pth'.format(epoch)
+                     ),
+                 )
++                write_model_metadata(
++                    os.path.join(cfg.OUTPUT_DIR, cfg.MODEL.NAME + '_{}.pth'.format(epoch)),
++                    model_to_save)
+ 
+         if epoch % eval_period == 0:
+             model.eval()
+@@ -311,6 +335,14 @@
+                     logger.info(f'CMC curve, Rank-{r:<2}: {cmc[r-1]:.2%}')
+             torch.cuda.empty_cache()
+ 
++        # All ranks participate, after validation and all epoch RNG consumption.
++        if epoch % checkpoint_period == 0:
++            save_training_checkpoint(
++                os.path.join(cfg.OUTPUT_DIR, cfg.MODEL.NAME + '_{}_resume.pth'.format(epoch)),
++                model_meta, cfg, epoch, optimizer, optimizer_center, scheduler,
++                scaler, proto_bank if use_aux_modules else None, center_criterion,
++                train_loader)
++
+ 
+ def do_inference(cfg,
+                  model,
+--- before/WHU/config/defaults.py
++++ after/WHU/config/defaults.py
+@@ -40,6 +40,17 @@
+ _C.MODEL.TRIPLET_LOSS_WEIGHT = 1.0
+ _C.MODEL.PCA_LOSS_WEIGHT = 0.0
+ _C.MODEL.GPD_MOMENTUM = 0.2
++
++_C.MODEL.FEATURE_AUG = CN()
++_C.MODEL.FEATURE_AUG.TYPE = 'none'
++_C.MODEL.FEATURE_AUG.DIM = 192
++_C.MODEL.FEATURE_AUG.NUM_QUERY = 2
++_C.MODEL.FEATURE_AUG.TOPK = 16
++_C.MODEL.FEATURE_AUG.NUM_HEADS = 4
++_C.MODEL.FEATURE_AUG.LOCAL_TAU = 0.1
++_C.MODEL.FEATURE_AUG.GAMMA = 0.05
++_C.MODEL.FEATURE_AUG.LOCAL_CE_WEIGHT = 0.05
++_C.MODEL.FEATURE_AUG.MASK_OUT_INIT_STD = 0.005
+ 
+ _C.MODEL.METRIC_LOSS_TYPE = 'triplet'
+ # If train with multi-gpu ddp mode, options: 'True', 'False'
+@@ -173,6 +184,7 @@
+ _C.SOLVER.IMS_PER_BATCH = 64
+ 
+ _C.SOLVER.LOSS_TYPE = "base"
++_C.SOLVER.RESUME = ''  # Full epoch-boundary training state; not a raw model file.
+ 
+ # ---------------------------------------------------------------------------- #
+ # TEST
+--- before/WHU/loss/make_loss.py
++++ after/WHU/loss/make_loss.py
+@@ -36,4 +36,6 @@
+         TRI_LOSS = triplet(feat, target)[0]
+         return cfg.MODEL.ID_LOSS_WEIGHT * ID_LOSS + cfg.MODEL.TRIPLET_LOSS_WEIGHT * TRI_LOSS, ID_LOSS, TRI_LOSS
+ 
++    # Reuse the actual main identity criterion, including its smoothing setting.
++    loss_func.id_criterion = xent if cfg.MODEL.IF_LABELSMOOTH == 'on' else F.cross_entropy
+     return loss_func, center_criterion
+--- before/WHU/train.py
++++ after/WHU/train.py
+@@ -86,6 +86,8 @@
+     if args.config_file != "":
+         cfg.merge_from_file(args.config_file)
+     cfg.merge_from_list(args.opts)
++    if cfg.MODEL.PRETRAIN_CHOICE == 'resume' and not cfg.SOLVER.RESUME:
++        raise ValueError('PRETRAIN_CHOICE=resume requires SOLVER.RESUME (a full training checkpoint)')
+     cfg.freeze()
+ 
+     setup_cuda_visible_devices(cfg)
+--- before/WHU/test.py
++++ after/WHU/test.py
+@@ -32,6 +32,9 @@
+     if args.config_file != "":
+         cfg.merge_from_file(args.config_file)
+     cfg.merge_from_list(args.opts)
++    # Evaluation loads the whole checkpoint; it must not depend on ImageNet weights.
++    cfg.MODEL.PRETRAIN_CHOICE = 'none'
++    cfg.SOLVER.RESUME = ''
+     cfg.freeze()
+ 
+     setup_cuda_visible_devices(cfg)
+--- /dev/null
++++ after/WHU/model/modules/__init__.py
+@@ -0,0 +1,2 @@
++from .a1_local import A1LocalEnhancement
++from .a2_modulation import A2FeatureModulation
+--- /dev/null
++++ after/WHU/model/modules/common.py
+@@ -0,0 +1,22 @@
++"""Initialization shared by the lightweight experimental branches."""
++import torch.nn as nn
++
++
++def init_branch(module):
++    for layer in module.modules():
++        if isinstance(layer, nn.Linear):
++            nn.init.trunc_normal_(layer.weight, std=0.02)
++            if layer.bias is not None:
++                nn.init.zeros_(layer.bias)
++        elif isinstance(layer, nn.MultiheadAttention):
++            nn.init.trunc_normal_(layer.in_proj_weight, std=0.02)
++            if layer.in_proj_bias is not None:
++                nn.init.zeros_(layer.in_proj_bias)
++        elif isinstance(layer, nn.LayerNorm) and layer.elementwise_affine:
++            nn.init.ones_(layer.weight)
++            nn.init.zeros_(layer.bias)
++
++
++def validate_dimensions(dim, num_query, num_heads):
++    if dim <= 0 or num_query <= 0 or num_heads <= 0 or dim % num_heads:
++        raise ValueError('Positive dimensions/queries/heads and DIM divisible by NUM_HEADS are required')
+--- /dev/null
++++ after/WHU/model/modules/a1_local.py
+@@ -0,0 +1,55 @@
++"""ViSA-inspired selection/relations; the explicit Lite adaptation in idea §2."""
++import torch
++from torch import nn
++from torch.nn import functional as F
++from .common import init_branch, validate_dimensions
++
++
++class A1LocalEnhancement(nn.Module):
++    def __init__(self, in_dim=768, dim=192, num_query=2, topk=16,
++                 num_heads=4, tau=0.1, gamma=0.05):
++        super().__init__()
++        validate_dimensions(dim, num_query, num_heads)
++        if topk <= 0 or tau <= 0 or gamma < 0:
++            raise ValueError('A1 requires TOPK/Tau > 0 and GAMMA >= 0')
++        self.dim, self.num_query = dim, num_query
++        self.topk, self.tau, self.gamma = topk, tau, gamma
++        self.patch_norm = nn.LayerNorm(in_dim)
++        self.patch_proj = nn.Linear(in_dim, dim)
++        self.query_tokens = nn.Parameter(torch.empty(num_query, dim))
++        self.query_proj = nn.Linear(in_dim, num_query * dim)
++        self.relation_norm = nn.LayerNorm(dim)
++        self.relation_attn = nn.MultiheadAttention(dim, num_heads, batch_first=True)
++        self.output_proj = nn.Linear(num_query * dim, in_dim)
++        self.output_norm = nn.LayerNorm(in_dim, elementwise_affine=False)
++        init_branch(self)
++        nn.init.trunc_normal_(self.query_tokens, std=0.02)
++
++    def forward(self, cls, patches, return_details=False):
++        b, n, _ = patches.shape
++        if n == 0:
++            raise ValueError('A1 needs at least one patch')
++        values = self.patch_proj(self.patch_norm(patches))
++        query = self.query_tokens.unsqueeze(0) + self.query_proj(cls.detach()).reshape(
++            b, self.num_query, self.dim)
++        # Explicitly disable autocast: float() alone does not keep matmul in FP32.
++        with torch.autocast(device_type=values.device.type, enabled=False):
++            scores = F.normalize(query.float(), dim=-1) @ F.normalize(
++                values.float(), dim=-1).transpose(1, 2)
++            top_scores, indices = scores.topk(min(self.topk, n), dim=-1)
++            weights = F.softmax(top_scores / self.tau, dim=-1)
++        k = indices.shape[-1]
++        neighborhoods = values.unsqueeze(1).expand(-1, self.num_query, -1, -1).gather(
++            2, indices.unsqueeze(-1).expand(-1, -1, -1, self.dim))
++        neighborhoods = neighborhoods.reshape(b * self.num_query, k, self.dim)
++        normed = self.relation_norm(neighborhoods)
++        related = neighborhoods + self.relation_attn(
++            normed, normed, normed, need_weights=False)[0]
++        related = related.reshape(b, self.num_query, k, self.dim)
++        local = (weights.to(related.dtype).unsqueeze(-1) * related).sum(dim=2)
++        u = self.output_norm(self.output_proj(local.reshape(b, -1)))
++        z = cls + self.gamma * u
++        if return_details:
++            return z, u, {'top_scores': top_scores, 'weights': weights,
++                          'indices': indices, 'query': query}
++        return z, u
+--- /dev/null
++++ after/WHU/model/modules/a2_modulation.py
+@@ -0,0 +1,54 @@
++"""QVAM VAD/AFM adapted according to idea §3 (no prompt/CLS value bypass)."""
++import torch
++from torch import nn
++from .common import init_branch, validate_dimensions
++
++
++class A2FeatureModulation(nn.Module):
++    def __init__(self, in_dim=768, dim=192, num_query=4, num_heads=4,
++                 gamma=0.2, mask_out_init_std=0.005):
++        super().__init__()
++        validate_dimensions(dim, num_query, num_heads)
++        if not 0 <= gamma < 1 or mask_out_init_std <= 0:
++            raise ValueError('A2 requires 0 <= GAMMA < 1 and nonzero mask initialization')
++        self.gamma = gamma
++        self.patch_proj = nn.Linear(in_dim, dim)
++        self.query_tokens = nn.Parameter(torch.empty(num_query, dim))
++        self.vad_self_norm = nn.LayerNorm(dim)
++        self.vad_self_attn = nn.MultiheadAttention(dim, num_heads, batch_first=True)
++        self.vad_cross_norm = nn.LayerNorm(dim)
++        self.vad_cross_attn = nn.MultiheadAttention(dim, num_heads, batch_first=True)
++        # One lightweight FFN, only after patch reading (QVAM Eq. 1).
++        self.vad_ffn = nn.Sequential(nn.LayerNorm(dim), nn.Linear(dim, 2 * dim),
++                                     nn.GELU(), nn.Linear(2 * dim, dim))
++        self.mask_token = nn.Parameter(torch.empty(1, 1, dim))
++        self.cls_proj = nn.Linear(in_dim, dim)
++        self.afm_query_norm = nn.LayerNorm(dim)
++        self.afm_cross_attn = nn.MultiheadAttention(dim, num_heads, batch_first=True)
++        self.mask_head = nn.Sequential(nn.LayerNorm(dim), nn.Linear(dim, 2 * dim),
++                                       nn.GELU(), nn.LayerNorm(2 * dim),
++                                       nn.Linear(2 * dim, in_dim))
++        init_branch(self)
++        nn.init.trunc_normal_(self.query_tokens, std=0.02)
++        nn.init.trunc_normal_(self.mask_token, std=0.02)
++        nn.init.normal_(self.mask_head[-1].weight, std=mask_out_init_std)
++        nn.init.zeros_(self.mask_head[-1].bias)
++
++    def forward(self, cls, patches, return_details=False):
++        if patches.shape[1] == 0:
++            raise ValueError('A2 needs at least one patch')
++        patches = self.patch_proj(patches)
++        queries = self.query_tokens.unsqueeze(0).expand(cls.shape[0], -1, -1)
++        normed = self.vad_self_norm(queries)
++        qs = queries + self.vad_self_attn(normed, normed, normed, need_weights=False)[0]
++        cond = self.vad_cross_attn(self.vad_cross_norm(qs), patches, patches,
++                                   need_weights=False)[0]
++        cond = cond + self.vad_ffn(cond)  # No addition of qs.
++        m0 = self.mask_token + self.cls_proj(cls.detach()).unsqueeze(1)
++        read = self.afm_cross_attn(self.afm_query_norm(m0), cond, cond,
++                                   need_weights=False)[0]  # No addition of m0.
++        mask = torch.sigmoid(self.mask_head(read.squeeze(1)))
++        z = cls * (1.0 + self.gamma * (2.0 * mask - 1.0))
++        if return_details:
++            return z, {'mask': mask, 'condition': cond}
++        return z
+--- /dev/null
++++ after/WHU/utils/checkpoint.py
+@@ -0,0 +1,202 @@
++"""Strict model loading and epoch-boundary single-process/DDP training state."""
++import json
++import logging
++import os
++import random
++import hashlib
++from collections.abc import Mapping
++
++import numpy as np
++import torch
++import torch.distributed as dist
++
++
++def read_checkpoint(path):
++    try:
++        return torch.load(path, map_location='cpu', weights_only=False)
++    except TypeError:  # Older PyTorch used by the original project.
++        return torch.load(path, map_location='cpu')
++
++
++def clean_state_dict(checkpoint):
++    state = checkpoint
++    for name in ('model', 'state_dict'):
++        if isinstance(state, Mapping) and name in state:
++            state = state[name]
++    if not isinstance(state, Mapping):
++        raise ValueError('Checkpoint does not contain a model state dictionary')
++    result = {}
++    for key, value in state.items():
++        while key.startswith('module.'):
++            key = key[len('module.'):]
++        if key in result:
++            raise ValueError('Duplicate key after stripping module prefix: ' + key)
++        if not isinstance(value, torch.Tensor):
++            raise ValueError('Non-tensor model state: ' + key)
++        result[key] = value
++    return result
++
++
++def _validate_state(model, state, allowed_missing=()):
++    current = model.state_dict()
++    missing = set(current) - set(state)
++    unexpected = set(state) - set(current)
++    mismatch = [k for k in set(state) & set(current) if state[k].shape != current[k].shape]
++    if missing != set(allowed_missing) or unexpected or mismatch:
++        raise ValueError('Checkpoint mismatch: missing={}, unexpected={}, shapes={}'.format(
++            sorted(missing), sorted(unexpected), sorted(mismatch)))
++
++
++def load_model_checkpoint(model, path, mode='eval'):
++    if mode not in ('eval', 'resume', 'uad_init'):
++        raise ValueError('Unknown checkpoint loading mode: ' + mode)
++    checkpoint = read_checkpoint(path)
++    state = clean_state_dict(checkpoint)
++    metadata = checkpoint.get('metadata')
++    sidecar = str(path) + '.meta.json'
++    if metadata is None and os.path.isfile(sidecar):
++        with open(sidecar, encoding='utf-8') as stream:
++            metadata = json.load(stream)
++    if mode == 'uad_init':
++        if metadata is not None and metadata.get('type') != 'none':
++            raise ValueError('uad_init must use a Baseline UAD checkpoint')
++        roots = ('feature_aug.', 'local_bottleneck.', 'local_classifier.')
++        allowed = {k for k in model.state_dict() if k.startswith(roots)}
++    else:
++        allowed = set()
++        if metadata is not None and metadata != model.checkpoint_metadata:
++            raise ValueError('Model/config metadata does not match checkpoint')
++        if metadata is None:
++            logging.getLogger('transreid').warning(
++                'Legacy raw checkpoint has no metadata: strictly checking all keys/shapes, '
++                'but non-tensor settings (e.g. GAMMA) cannot be verified.')
++    _validate_state(model, state, allowed)
++    result = model.load_state_dict(state, strict=not allowed)
++    logging.getLogger('transreid').info(
++        'Loaded %s (%s): %d tensors; initialized new tensors: %s',
++        path, mode, len(state), sorted(result.missing_keys))
++    return checkpoint
++
++
++def write_model_metadata(path, model):
++    with open(str(path) + '.meta.json', 'w', encoding='utf-8') as stream:
++        json.dump(model.checkpoint_metadata, stream, indent=2)
++
++
++def _plain(value):
++    if isinstance(value, Mapping):
++        return {k: _plain(v) for k, v in value.items()}
++    if isinstance(value, (tuple, list)):
++        return [_plain(v) for v in value]
++    return value
++
++
++def training_signature(cfg):
++    sections = {k: _plain(getattr(cfg, k)) for k in
++                ('MODEL', 'INPUT', 'DATASETS', 'DATALOADER', 'SOLVER', 'TEST')}
++    for k in ('PRETRAIN_CHOICE', 'PRETRAIN_PATH', 'DEVICE_ID'):
++        sections['MODEL'].pop(k, None)
++    for k in ('RESUME', 'LOG_PERIOD', 'CHECKPOINT_PERIOD'):
++        sections['SOLVER'].pop(k, None)
++    sections['TEST'].pop('WEIGHT', None)
++    return sections
++
++
++def _rng_state():
++    state = {'python': random.getstate(), 'numpy': np.random.get_state(),
++             'torch': torch.get_rng_state()}
++    if torch.cuda.is_available():
++        state['cuda'] = torch.cuda.get_rng_state(torch.cuda.current_device())
++    return state
++
++
++def _restore_rng(state):
++    random.setstate(state['python'])
++    np.random.set_state(state['numpy'])
++    torch.set_rng_state(state['torch'])
++    if 'cuda' in state:
++        torch.cuda.set_rng_state(state['cuda'], torch.cuda.current_device())
++
++
++def _loader_signature(loader):
++    # PKM __iter__ updates its estimated length: do not compare len(loader).
++    source = getattr(loader.dataset, 'dataset', None)
++    manifest = json.dumps(_plain(source), ensure_ascii=True, sort_keys=True).encode('utf-8')
++    return {'dataset_length': len(loader.dataset),
++            'manifest_sha256': hashlib.sha256(manifest).hexdigest(),
++            'batch_size': loader.batch_sampler.batch_size,
++            'drop_last': loader.batch_sampler.drop_last,
++            'num_workers': loader.num_workers,
++            'persistent_workers': loader.persistent_workers}
++
++
++def save_training_checkpoint(path, model, cfg, epoch, optimizer, optimizer_center,
++                             scheduler, scaler, bank, center_criterion, loader):
++    distributed = dist.is_available() and dist.is_initialized()
++    world = dist.get_world_size() if distributed else 1
++    rank = dist.get_rank() if distributed else 0
++    # BN statistics may differ by rank between validation epochs.
++    runtime = {'rng': _rng_state(), 'buffers': {
++        k: v.detach().cpu().clone() for k, v in model.named_buffers()}}
++    states = [None] * world
++    if distributed:
++        dist.all_gather_object(states, runtime)
++    else:
++        states[0] = runtime
++    if rank == 0:
++        checkpoint = {
++            'format_version': 1, 'model': model.state_dict(),
++            'metadata': model.checkpoint_metadata, 'config': cfg.dump(),
++            'training_signature': training_signature(cfg),
++            'loader_signature': _loader_signature(loader),
++            'epoch': epoch, 'world_size': world, 'rank_states': states,
++            'optimizer': optimizer.state_dict(),
++            'optimizer_center': optimizer_center.state_dict(),
++            'center_criterion': center_criterion.state_dict(),
++            'scheduler': scheduler.state_dict(), 'scaler': scaler.state_dict(),
++            'prototype_bank': bank.state_dict() if bank is not None else None,
++        }
++        temp = str(path) + '.tmp'
++        torch.save(checkpoint, temp)
++        os.replace(temp, path)
++    if distributed:
++        dist.barrier()
++
++
++def restore_training_checkpoint(path, model, cfg, optimizer, optimizer_center,
++                                scheduler, scaler, bank, center_criterion, loader):
++    checkpoint = read_checkpoint(path)
++    required = {'format_version', 'model', 'metadata', 'epoch', 'world_size',
++                'rank_states', 'optimizer', 'optimizer_center', 'center_criterion',
++                'scheduler', 'scaler', 'prototype_bank', 'training_signature',
++                'loader_signature'}
++    if not required.issubset(checkpoint) or checkpoint['format_version'] != 1:
++        raise ValueError('Resume requires a full *_resume.pth checkpoint, not model-only weights')
++    distributed = dist.is_available() and dist.is_initialized()
++    world = dist.get_world_size() if distributed else 1
++    rank = dist.get_rank() if distributed else 0
++    if checkpoint['world_size'] != world or len(checkpoint['rank_states']) != world:
++        raise ValueError('Resume requires the same world size')
++    if checkpoint['metadata'] != model.checkpoint_metadata:
++        raise ValueError('Resume model metadata mismatch')
++    if checkpoint['training_signature'] != training_signature(cfg):
++        raise ValueError('Resume training configuration mismatch')
++    if checkpoint['loader_signature'] != _loader_signature(loader) or loader.persistent_workers:
++        raise ValueError('Resume loader mismatch or unsupported persistent worker RNG')
++    if (bank is None) != (checkpoint['prototype_bank'] is None):
++        raise ValueError('Resume prototype bank mismatch')
++    state = clean_state_dict(checkpoint)
++    _validate_state(model, state)
++    model.load_state_dict(state, strict=True)
++    optimizer.load_state_dict(checkpoint['optimizer'])
++    optimizer_center.load_state_dict(checkpoint['optimizer_center'])
++    center_criterion.load_state_dict(checkpoint['center_criterion'], strict=True)
++    scheduler.load_state_dict(checkpoint['scheduler'])
++    scaler.load_state_dict(checkpoint['scaler'])
++    if bank is not None:
++        bank.load_state_dict(checkpoint['prototype_bank'], strict=True)
++    buffers = dict(model.named_buffers())
++    for k, value in checkpoint['rank_states'][rank]['buffers'].items():
++        buffers[k].copy_(value.to(buffers[k].device))
++    _restore_rng(checkpoint['rank_states'][rank]['rng'])
++    return checkpoint['epoch']
+--- /dev/null
++++ after/WHU/configs/UAD_A1.yml
+@@ -0,0 +1,65 @@
++MODEL:
++  FEATURE_AUG:
++    TYPE: 'a1'
++    DIM: 192
++    NUM_QUERY: 2
++    TOPK: 16
++    NUM_HEADS: 4
++    LOCAL_TAU: 0.1
++    GAMMA: 0.05
++    LOCAL_CE_WEIGHT: 0.05
++  PRETRAIN_CHOICE: 'imagenet'
++  PRETRAIN_PATH: 'jx_vit_base_p16_224-80ecf9dd.pth'
++  METRIC_LOSS_TYPE: 'wrt'
++  IF_LABELSMOOTH: 'off'
++  IF_WITH_CENTER: 'no'
++  NAME: 'transformer'
++  NO_MARGIN: True
++  TRANSFORMER_TYPE: 'vit_base_in'
++  STRIDE_SIZE: [16, 16]
++  PCA_LOSS_WEIGHT: 0.01
++  # New-center weight; equivalent to alpha=0.8 on the old prototype in Eq. (7).
++  GPD_MOMENTUM: 0.2
++
++INPUT:
++  SIZE_TRAIN: [256, 128]
++  SIZE_TEST: [256, 128]
++  PROB: 0.5 # random horizontal flip
++  RE_PROB: 0.5 # random erasing
++  PADDING: 10
++  PIXEL_MEAN: [0.5, 0.5, 0.5]
++  PIXEL_STD: [0.5, 0.5, 0.5]
++
++DATASETS:
++  NAMES: ('WHU-MARS')
++  ROOT_DIR: ('/project/code/data')
++  MODALITIES: ['RGB', 'IR', 'Thermal']
++
++DATALOADER:
++  SAMPLER: 'PKM'
++  NUM_INSTANCE: 4
++  NUM_WORKERS: 8
++
++SOLVER:
++  OPTIMIZER_NAME: 'SGD'
++  MAX_EPOCHS: 120
++  BASE_LR: 0.008
++  IMS_PER_BATCH: 64
++  SEED: 1234
++  WARMUP_METHOD: 'linear'
++  WARMUP_EPOCHS: 5
++  CHECKPOINT_PERIOD: 120
++  LOG_PERIOD: 50
++  EVAL_PERIOD: 10
++  WEIGHT_DECAY:  1e-4
++  WEIGHT_DECAY_BIAS: 1e-4
++  BIAS_LR_FACTOR: 2
++  LOSS_TYPE: "base+pca+gpd"
++
++TEST:
++  IMS_PER_BATCH: 512
++  RE_RANKING: False
++  NECK_FEAT: 'before'
++  FEAT_NORM: 'yes'
++
++OUTPUT_DIR: './logs/UAD_A1_1000'
+--- /dev/null
++++ after/WHU/configs/UAD_A2.yml
+@@ -0,0 +1,64 @@
++MODEL:
++  FEATURE_AUG:
++    TYPE: 'a2'
++    DIM: 192
++    NUM_QUERY: 4
++    NUM_HEADS: 4
++    GAMMA: 0.2
++    LOCAL_CE_WEIGHT: 0.0
++    MASK_OUT_INIT_STD: 0.005
++  PRETRAIN_CHOICE: 'imagenet'
++  PRETRAIN_PATH: 'jx_vit_base_p16_224-80ecf9dd.pth'
++  METRIC_LOSS_TYPE: 'wrt'
++  IF_LABELSMOOTH: 'off'
++  IF_WITH_CENTER: 'no'
++  NAME: 'transformer'
++  NO_MARGIN: True
++  TRANSFORMER_TYPE: 'vit_base_in'
++  STRIDE_SIZE: [16, 16]
++  PCA_LOSS_WEIGHT: 0.01
++  # New-center weight; equivalent to alpha=0.8 on the old prototype in Eq. (7).
++  GPD_MOMENTUM: 0.2
++
++INPUT:
++  SIZE_TRAIN: [256, 128]
++  SIZE_TEST: [256, 128]
++  PROB: 0.5 # random horizontal flip
++  RE_PROB: 0.5 # random erasing
++  PADDING: 10
++  PIXEL_MEAN: [0.5, 0.5, 0.5]
++  PIXEL_STD: [0.5, 0.5, 0.5]
++
++DATASETS:
++  NAMES: ('WHU-MARS')
++  ROOT_DIR: ('/project/code/data')
++  MODALITIES: ['RGB', 'IR', 'Thermal']
++
++DATALOADER:
++  SAMPLER: 'PKM'
++  NUM_INSTANCE: 4
++  NUM_WORKERS: 8
++
++SOLVER:
++  OPTIMIZER_NAME: 'SGD'
++  MAX_EPOCHS: 120
++  BASE_LR: 0.008
++  IMS_PER_BATCH: 64
++  SEED: 1234
++  WARMUP_METHOD: 'linear'
++  WARMUP_EPOCHS: 5
++  CHECKPOINT_PERIOD: 120
++  LOG_PERIOD: 50
++  EVAL_PERIOD: 10
++  WEIGHT_DECAY:  1e-4
++  WEIGHT_DECAY_BIAS: 1e-4
++  BIAS_LR_FACTOR: 2
++  LOSS_TYPE: "base+pca+gpd"
++
++TEST:
++  IMS_PER_BATCH: 512
++  RE_RANKING: False
++  NECK_FEAT: 'before'
++  FEAT_NORM: 'yes'
++
++OUTPUT_DIR: './logs/UAD_A2_1000'
+--- /dev/null
++++ after/WHU/tests/test_feature_aug.py
+@@ -0,0 +1,359 @@
++"""CPU acceptance tests; no dataset or pretrained weights required."""
++import copy
++import gc
++import importlib
++import importlib.util
++import random
++import sys
++import types
++from pathlib import Path
++from unittest.mock import patch
++
++import numpy as np
++import pytest
++import torch
++from torch import nn
++from torch.nn import functional as F
++from torch.utils.data import DataLoader, TensorDataset
++
++ROOT = Path(__file__).resolve().parents[1]
++sys.path.insert(0, str(ROOT))
++from config import cfg as defaults
++from model import make_model
++from model.backbones.vit_pytorch import TransReID
++from model.modules import A1LocalEnhancement, A2FeatureModulation
++from processor.processor import PCA, GPD, PrototypeBank
++from solver import make_optimizer
++from solver.scheduler_factory import create_scheduler
++from utils.checkpoint import (load_model_checkpoint, save_training_checkpoint,
++                              restore_training_checkpoint, write_model_metadata)
++
++torch.set_num_threads(2)
++
++
++def configuration(kind='none'):
++    cfg = defaults.clone()
++    cfg.merge_from_file(str(ROOT / 'configs' / ('UAD.yml' if kind == 'none' else 'UAD_' + kind.upper() + '.yml')))
++    cfg.MODEL.PRETRAIN_CHOICE = 'none'
++    return cfg
++
++
++def identity_loss(cfg, classes=3):
++    module = importlib.import_module('loss.make_loss')
++    center_cls = module.CenterLoss
++    with patch.object(module, 'CenterLoss', side_effect=lambda **kw: center_cls(
++            num_classes=kw['num_classes'], feat_dim=kw['feat_dim'], use_gpu=False)):
++        criterion, center = module.make_loss(cfg, classes)
++    if cfg.MODEL.IF_LABELSMOOTH == 'on':
++        criterion.id_criterion.use_gpu = False  # CPU testing only; original criterion.
++    return criterion, center
++
++
++def assert_gradient(parameter):
++    assert parameter.grad is not None
++    assert torch.isfinite(parameter.grad).all()
++    assert parameter.grad.abs().sum() > 0
++
++
++def cpu_scaler():
++    # CPU GradScaler is newer than the production project's torch==2.2.2.
++    if hasattr(torch.amp, 'GradScaler'):
++        return torch.amp.GradScaler('cpu')
++    return torch.cuda.amp.GradScaler(enabled=False)
++
++
++@pytest.mark.parametrize('n', [1, 7, 128])
++def test_a1_shapes_selection_and_detach(n):
++    torch.manual_seed(10)
++    module = A1LocalEnhancement()
++    cls = torch.randn(4, 768, requires_grad=True)
++    patches = torch.randn(4, n, 768, requires_grad=True)
++    z, u, details = module(cls, patches, return_details=True)
++    assert z.shape == u.shape == (4, 768)
++    assert details['indices'].shape == (4, 2, min(16, n))
++    assert details['top_scores'].dtype == torch.float32
++    details['top_scores'].retain_grad()
++    (u * torch.randn_like(u)).sum().backward()
++    assert cls.grad is None  # No CLS value/query-conditioning gradient shortcut.
++    assert_gradient(patches)
++    assert_gradient(module.patch_proj.weight)
++    assert_gradient(module.relation_attn.in_proj_weight)
++    if n > 1:
++        assert_gradient(details['top_scores'])
++        assert_gradient(module.query_tokens)
++        assert_gradient(module.query_proj.weight)
++    torch.testing.assert_close(z, cls + 0.05 * u, rtol=0, atol=0)
++
++
++def test_a1_amp_scores_stay_fp32():
++    module = A1LocalEnhancement()
++    with torch.autocast('cpu', dtype=torch.bfloat16):
++        z, u, details = module(torch.randn(4, 768), torch.randn(4, 23, 768), True)
++    assert details['top_scores'].dtype == details['weights'].dtype == torch.float32
++    assert torch.isfinite(z).all()
++    z.square().mean().backward()
++    assert_gradient(module.query_proj.weight)
++
++
++def test_a2_initialization_gradient_and_patch_dependency():
++    torch.manual_seed(11)
++    module = A2FeatureModulation()
++    cls = torch.randn(8, 768, requires_grad=True)
++    patches = torch.randn(8, 128, 768, requires_grad=True)
++    z, details = module(cls, patches, True)
++    mask, cond = details['mask'], details['condition']
++    assert z.shape == mask.shape == (8, 768)
++    assert cond.shape == (8, 4, 192)
++    assert abs(mask.mean().item() - 0.5) < 0.03
++    assert 0.005 < mask.std().item() < 0.08
++    scale = 1 + 0.2 * (2 * mask - 1)
++    assert scale.min() >= 0.8 and scale.max() <= 1.2
++    assert (z - cls).norm() / cls.norm() < 0.06
++    (mask * torch.randn_like(mask)).sum().backward()
++    assert cls.grad is None
++    for parameter in [patches, module.query_tokens, module.vad_self_attn.in_proj_weight,
++                      module.vad_cross_attn.in_proj_weight, module.vad_ffn[-1].weight,
++                      module.cls_proj.weight, module.mask_token,
++                      module.afm_cross_attn.in_proj_weight, module.mask_head[-1].weight]:
++        assert_gradient(parameter)
++    with torch.no_grad():
++        different = module(cls, patches + torch.randn_like(patches), True)[1]['mask']
++    assert (different - mask).abs().max() > 1e-5
++
++
++def test_token_taps_are_exact_one_pass():
++    model = TransReID(img_size=(32, 32), patch_size=16, stride_size=(16, 16),
++                     embed_dim=48, depth=12, num_heads=4, qkv_bias=True).eval()
++    observed, count = {}, [0] * 12
++    handles = []
++    for i, block in enumerate(model.blocks):
++        def record(_, args, output, i=i):
++            count[i] += 1
++            if i == 10:
++                observed['l11'] = output[:, 1:]
++        handles.append(block.register_forward_hook(record))
++    images = torch.randn(2, 3, 32, 32)
++    cls, patches = model(images, return_tokens='l11')
++    assert count == [1] * 12
++    torch.testing.assert_close(patches, observed['l11'], rtol=0, atol=0)
++    assert patches.requires_grad
++    for handle in handles:
++        handle.remove()
++    torch.testing.assert_close(model(images), cls, rtol=0, atol=0)
++    normalized = []
++    handle = model.norm.register_forward_hook(lambda _, args, out: normalized.append(out))
++    cls12, p12 = model(images, return_tokens='l12')
++    handle.remove()
++    torch.testing.assert_close(p12, normalized[0][:, 1:], rtol=0, atol=0)
++    torch.testing.assert_close(cls12, cls, rtol=0, atol=0)
++
++
++def test_baseline_matches_pre_edit_snapshot():
++    original = ROOT.parent / 'tmp' / 'uad_original'
++    if not original.exists():
++        pytest.skip('Pre-edit snapshot is only available in the implementation workspace')
++    spec = importlib.util.spec_from_file_location('_original_vit', original / 'model/backbones/vit_pytorch.py')
++    vit = importlib.util.module_from_spec(spec)
++    sys.modules[spec.name] = vit
++    spec.loader.exec_module(vit)
++    old = types.ModuleType('_original_model')
++    source = (original / 'model/make_model.py').read_text(encoding='utf-8').replace(
++        'from .backbones.vit_pytorch import', 'from _original_vit import')
++    exec(compile(source, str(original / 'model/make_model.py'), 'exec'), old.__dict__)
++    cfg = configuration()
++    torch.manual_seed(77)
++    before = old.make_model(cfg, 3, 0, 0)
++    torch.manual_seed(77)
++    after = make_model(cfg, 3, 0, 0)
++    assert set(before.state_dict()) == set(after.state_dict())
++    for key, value in before.state_dict().items():
++        torch.testing.assert_close(after.state_dict()[key], value, rtol=0, atol=0)
++    images = [torch.randn(2, 3, 256, 128) for _ in range(3)]
++    with torch.no_grad():
++        before.eval()
++        after.eval()
++        for neck in ('before', 'after'):
++            before.neck_feat = after.neck_feat = neck
++            for mode in (1, 2, 3):
++                torch.testing.assert_close(before(images[0], mode=mode), after(images[0], mode=mode), rtol=0, atol=0)
++        before.train()
++        after.train()
++        torch.manual_seed(78)
++        original_outputs = before(images)
++        torch.manual_seed(78)
++        current_outputs = after(images)
++        for key, expected in zip(('cls_score', 'global_feat', 'bn_feat'), original_outputs):
++            torch.testing.assert_close(current_outputs[key], expected, rtol=0, atol=0)
++    del before, after
++    gc.collect()
++
++
++@pytest.mark.parametrize('kind', ['none', 'a1', 'a2'])
++def test_full_vit_training_losses_optimizer_and_inference(kind):
++    torch.manual_seed(12)
++    cfg = configuration(kind)
++    model = make_model(cfg, 3, 0, 0)
++    criterion, center = identity_loss(cfg)
++    optimizer, _ = make_optimizer(cfg, model, center)
++    optimized = [id(p) for group in optimizer.param_groups for p in group['params']]
++    assert len(optimized) == len(set(optimized))
++    assert set(optimized) == {id(p) for p in model.parameters() if p.requires_grad}
++    imgs = [torch.randn(4, 3, 256, 128) for _ in range(3)]
++    labels = torch.tensor([0, 0, 1, 1])
++    output = model(imgs, labels)
++    assert output['global_feat'].shape == (12, 768)
++    assert (output['local_score'] is not None) == (kind == 'a1')
++    assert ('feature_aug' in model._modules) == (kind != 'none')
++    loss, _, _ = criterion(output['cls_score'], output['global_feat'], labels.repeat(3))
++    pca, ids, centers = PCA(output['global_feat'], labels, 3, group_size=2)
++    bank = PrototypeBank(3, 768, device='cpu')
++    gpd = GPD(output['global_feat'], labels, bank, ids, centers, 3)
++    total = loss + 0.01 * pca + gpd
++    if kind == 'a1':
++        local_ce = criterion.id_criterion(output['local_score'], labels.repeat(3))
++        torch.testing.assert_close(local_ce, F.cross_entropy(output['local_score'], labels.repeat(3)))
++        total = total + 0.05 * local_ce
++    assert torch.isfinite(total)
++    total.backward()
++    assert_gradient(model.base.blocks[10].attn.qkv.weight)
++    assert_gradient(model.base.blocks[11].attn.qkv.weight)
++    if kind != 'none':
++        for name, parameter in model.feature_aug.named_parameters():
++            assert_gradient(parameter)
++    optimizer.step()
++    bank.update(ids, centers, ddp=False)
++    model.eval()
++    with torch.no_grad():
++        expected, _ = model._extract_feature(imgs[0])
++        for mode in (1, 2, 3):
++            torch.testing.assert_close(model(imgs[0], mode=mode), expected, rtol=0, atol=0)
++        model.neck_feat = 'after'
++        torch.testing.assert_close(model(imgs[0], mode=1), model.bottleneck(expected), rtol=0, atol=0)
++    del model, optimizer, output, total
++    gc.collect()
++
++
++def test_main_and_local_identity_criterion_smoothing():
++    cfg = configuration('a1')
++    cfg.MODEL.IF_LABELSMOOTH = 'on'
++    criterion, _ = identity_loss(cfg)
++    logits = torch.randn(12, 3)
++    labels = torch.tensor([0, 0, 1, 1]).repeat(3)
++    main = criterion(logits, torch.randn(12, 768), labels)[1]
++    torch.testing.assert_close(main, criterion.id_criterion(logits, labels), rtol=0, atol=0)
++
++
++class SmallModel(nn.Module):
++    def __init__(self, aug=False):
++        super().__init__()
++        self.base = nn.Linear(8, 8)
++        self.bottleneck = nn.BatchNorm1d(8)
++        self.classifier = nn.Linear(8, 3)
++        if aug:
++            self.feature_aug = nn.Linear(8, 8)
++        self.checkpoint_metadata = {'version': 1, 'type': 'a1' if aug else 'none'}
++
++    def forward(self, x):
++        x = self.base(x)
++        if hasattr(self, 'feature_aug'):
++            x = x + 0.05 * self.feature_aug(x)
++        return self.classifier(self.bottleneck(x))
++
++
++def test_checkpoint_migration_and_rejections(tmp_path):
++    base, augmented = SmallModel(), SmallModel(True)
++    path = tmp_path / 'base.pth'
++    torch.save({'state_dict': {'module.' + k: v for k, v in base.state_dict().items()}}, path)
++    load_model_checkpoint(augmented, path, 'uad_init')
++    for key, value in base.state_dict().items():
++        torch.testing.assert_close(augmented.state_dict()[key], value, rtol=0, atol=0)
++    with pytest.raises(ValueError):
++        load_model_checkpoint(augmented, path)
++    state = base.state_dict()
++    state.pop('base.weight')
++    torch.save(state, path)
++    with pytest.raises(ValueError):
++        load_model_checkpoint(augmented, path, 'uad_init')
++    state = augmented.state_dict()
++    state['classifier.weight'] = torch.randn(4, 8)
++    torch.save(state, path)
++    with pytest.raises(ValueError):
++        load_model_checkpoint(augmented, path)
++    path = tmp_path / 'aug.pth'
++    torch.save(augmented.state_dict(), path)
++    write_model_metadata(path, augmented)
++    load_model_checkpoint(augmented, path)
++    augmented.checkpoint_metadata['gamma'] = 0.1
++    with pytest.raises(ValueError):
++        load_model_checkpoint(augmented, path)
++    augmented.checkpoint_metadata.pop('gamma')
++    with pytest.raises(ValueError):
++        load_model_checkpoint(base, path)
++
++
++def test_imagenet_interpolation_and_missing_keys(tmp_path):
++    source = TransReID(img_size=(32, 32), patch_size=16, stride_size=(16, 16),
++                      embed_dim=48, depth=12, num_heads=4, qkv_bias=True)
++    target = TransReID(img_size=(48, 32), patch_size=16, stride_size=(16, 16),
++                      embed_dim=48, depth=12, num_heads=4, qkv_bias=True)
++    state = {k: v for k, v in source.state_dict().items() if not k.startswith('fc.')}
++    state['head.weight'] = torch.randn(1000, 48)
++    path = tmp_path / 'imagenet.pth'
++    torch.save({'model': state}, path)
++    target.load_param(path)
++    torch.testing.assert_close(target.blocks[11].attn.qkv.weight, source.blocks[11].attn.qkv.weight)
++    assert target.pos_embed.shape == (1, 7, 48)
++    state.pop('blocks.11.norm1.weight')
++    torch.save(state, path)
++    with pytest.raises(ValueError):
++        target.load_param(path)
++
++
++def test_full_resume_reproduces_next_update(tmp_path):
++    torch.manual_seed(123)
++    random.seed(123)
++    np.random.seed(123)
++    cfg = configuration('a1')
++    model = SmallModel(True)
++    center = nn.Linear(8, 3)
++    optimizer = torch.optim.SGD(model.parameters(), lr=0.008, momentum=0.9)
++    optimizer_center = torch.optim.SGD(center.parameters(), lr=0.5)
++    scheduler = create_scheduler(cfg, optimizer)
++    scaler = cpu_scaler()
++    bank = PrototypeBank(3, 8, device='cpu')
++    loader = DataLoader(TensorDataset(torch.zeros(8, 8)), batch_size=4)
++
++    def step():
++        optimizer.zero_grad()
++        x = torch.randn(4, 8) + random.random() + float(np.random.rand())
++        loss = F.cross_entropy(model(x), torch.tensor([0, 0, 1, 1]))
++        scaler.scale(loss).backward()
++        scaler.step(optimizer)
++        scaler.update()
++        bank.update(torch.tensor([0, 1]), torch.randn(2, 8), ddp=False)
++        return loss.detach().clone()
++
++    scheduler.step(1)
++    step()
++    path = tmp_path / 'resume.pth'
++    save_training_checkpoint(path, model, cfg, 1, optimizer, optimizer_center,
++                             scheduler, scaler, bank, center, loader)
++    scheduler.step(2)
++    expected_loss = step()
++    expected_state = copy.deepcopy(model.state_dict())
++    expected_bank = bank.prototypes.clone()
++    expected_rng = (random.random(), np.random.rand(), torch.rand(1))
++    assert restore_training_checkpoint(path, model, cfg, optimizer, optimizer_center,
++                                       scheduler, scaler, bank, center, loader) == 1
++    scheduler.step(2)
++    torch.testing.assert_close(step(), expected_loss, rtol=0, atol=0)
++    for key, value in model.state_dict().items():
++        torch.testing.assert_close(value, expected_state[key], rtol=0, atol=0)
++    torch.testing.assert_close(bank.prototypes, expected_bank, rtol=0, atol=0)
++    assert random.random() == expected_rng[0]
++    assert np.random.rand() == expected_rng[1]
++    torch.testing.assert_close(torch.rand(1), expected_rng[2], rtol=0, atol=0)
++    cfg.MODEL.FEATURE_AUG.GAMMA = 0.1
++    with pytest.raises(ValueError):
++        restore_training_checkpoint(path, model, cfg, optimizer, optimizer_center,
++                                    scheduler, scaler, bank, center, loader)
+--- /dev/null
++++ after/WHU/tests/ddp_feature_aug.py
+@@ -0,0 +1,142 @@
++"""Two-rank CPU/Gloo acceptance; CUDA/NCCL training entry point is unchanged."""
++import argparse
++import gc
++import hashlib
++import json
++import random
++import socket
++import sys
++import tempfile
++from datetime import timedelta
++from pathlib import Path
++
++import numpy as np
++import torch
++import torch.distributed as dist
++import torch.multiprocessing as mp
++from torch.nn import functional as F
++from torch.nn.parallel import DistributedDataParallel
++from torch.utils.data import DataLoader, TensorDataset
++
++sys.path.insert(0, str(Path(__file__).resolve().parent))
++from test_feature_aug import (configuration, identity_loss, SmallModel, assert_gradient,
++                              cpu_scaler,
++                              make_model, make_optimizer, create_scheduler,
++                              PCA, GPD, PrototypeBank, save_training_checkpoint,
++                              restore_training_checkpoint)
++
++
++def worker(rank, world, port, output_dir):
++    torch.set_num_threads(2)
++    dist.init_process_group('gloo', init_method='tcp://127.0.0.1:{}'.format(port),
++                            rank=rank, world_size=world, timeout=timedelta(seconds=120))
++    results = {}
++    try:
++        for kind in ('none', 'a1', 'a2'):
++            torch.manual_seed(200 + rank)
++            cfg = configuration(kind)
++            cfg.INPUT.SIZE_TRAIN = [32, 32]  # Actual 12-block/768-dim backbone, small images.
++            model = make_model(cfg, 3, 0, 0)
++            ddp = DistributedDataParallel(model, find_unused_parameters=True)
++            criterion, center = identity_loss(cfg)
++            optimizer, _ = make_optimizer(cfg, model, center)
++            bank = PrototypeBank(3, 768, device='cpu')
++            labels = torch.tensor([0, 0, 1, 1])
++            losses = []
++            for step in range(2):
++                optimizer.zero_grad()
++                imgs = [torch.randn(4, 3, 32, 32) for _ in range(3)]
++                out = ddp(imgs)
++                loss = criterion(out['cls_score'], out['global_feat'], labels.repeat(3))[0]
++                pca, ids, centers = PCA(out['global_feat'], labels, 3, 2)
++                loss = loss + 0.01 * pca + GPD(out['global_feat'], labels, bank, ids, centers, 3)
++                if kind == 'a1':
++                    loss = loss + 0.05 * criterion.id_criterion(out['local_score'], labels.repeat(3))
++                loss.backward()
++                if kind != 'none':
++                    for parameter in model.feature_aug.parameters():
++                        assert_gradient(parameter)
++                optimizer.step()
++                bank.update(ids, centers, ddp=True)
++                losses.append(loss.item())
++            digest = hashlib.sha256()
++            for parameter in model.parameters():
++                digest.update(parameter.detach().numpy().tobytes())
++            hashes = [None] * world
++            dist.all_gather_object(hashes, digest.hexdigest())
++            assert len(set(hashes)) == 1, 'DDP parameters diverged'
++            banks = [torch.empty_like(bank.prototypes) for _ in range(world)]
++            dist.all_gather(banks, bank.prototypes)
++            for value in banks:
++                torch.testing.assert_close(value, bank.prototypes, rtol=0, atol=0)
++            # Unequal inference counts through the unwrapped module, as in processor.
++            model.eval()
++            for _ in range(rank + 1):
++                with torch.no_grad():
++                    assert model(imgs[0], mode=1).shape == (4, 768)
++            dist.barrier()
++            results[kind] = {'losses': losses, 'parameters_synchronized': True,
++                             'prototypes_synchronized': True, 'uneven_eval': True}
++            del ddp, model, optimizer, out, loss
++            gc.collect()
++
++        cfg = configuration('a1')
++        cfg.MODEL.DIST_TRAIN = True
++        small = SmallModel(True)
++        wrapped = DistributedDataParallel(small)
++        center = torch.nn.Linear(8, 3)
++        optimizer = torch.optim.SGD(small.parameters(), lr=0.008, momentum=0.9)
++        center_optimizer = torch.optim.SGD(center.parameters(), lr=0.5)
++        scheduler = create_scheduler(cfg, optimizer)
++        scaler = cpu_scaler()
++        bank = PrototypeBank(3, 8, device='cpu')
++        loader = DataLoader(TensorDataset(torch.zeros(8, 8)), batch_size=4)
++
++        def update():
++            optimizer.zero_grad()
++            loss = F.cross_entropy(wrapped(torch.randn(4, 8)), torch.tensor([0, 0, 1, 1]))
++            scaler.scale(loss).backward()
++            scaler.step(optimizer)
++            scaler.update()
++            bank.update(torch.tensor([0, 1]), torch.randn(2, 8), ddp=True)
++            return loss.detach().clone()
++
++        update()
++        small.bottleneck.running_mean.fill_(rank + 0.25)
++        saved_buffer = small.bottleneck.running_mean.clone()
++        random.seed(400 + rank)
++        np.random.seed(400 + rank)
++        path = Path(output_dir) / 'ddp_resume.pth'
++        save_training_checkpoint(path, small, cfg, 1, optimizer, center_optimizer,
++                                 scheduler, scaler, bank, center, loader)
++        expected_loss = update()
++        expected = {k: v.clone() for k, v in small.state_dict().items()}
++        expected_rng = (random.random(), float(np.random.rand()), torch.rand(1))
++        restore_training_checkpoint(path, small, cfg, optimizer, center_optimizer,
++                                    scheduler, scaler, bank, center, loader)
++        torch.testing.assert_close(small.bottleneck.running_mean, saved_buffer, rtol=0, atol=0)
++        torch.testing.assert_close(update(), expected_loss, rtol=0, atol=0)
++        for k, v in small.state_dict().items():
++            torch.testing.assert_close(v, expected[k], rtol=0, atol=0)
++        assert random.random() == expected_rng[0]
++        assert float(np.random.rand()) == expected_rng[1]
++        torch.testing.assert_close(torch.rand(1), expected_rng[2], rtol=0, atol=0)
++        results['resume'] = {'next_update_exact': True, 'rank_rng_exact': True,
++                             'rank_buffers_exact': True}
++        (Path(output_dir) / 'rank_{}.json'.format(rank)).write_text(json.dumps(results, indent=2))
++    finally:
++        dist.destroy_process_group()
++
++
++if __name__ == '__main__':
++    parser = argparse.ArgumentParser()
++    parser.add_argument('--output', default=None)
++    args = parser.parse_args()
++    with socket.socket() as sock:
++        sock.bind(('127.0.0.1', 0))
++        port = sock.getsockname()[1]
++    with tempfile.TemporaryDirectory() as temp:
++        output_dir = args.output or temp
++        Path(output_dir).mkdir(parents=True, exist_ok=True)
++        mp.spawn(worker, args=(2, port, output_dir), nprocs=2, join=True)
++        print('PASS: 2-rank DDP Baseline/A1/A2, prototype synchronization, uneven eval, full resume')
+--- /dev/null
++++ after/WHU/tools/check_feature_aug.py
+@@ -0,0 +1,85 @@
++"""Synthetic branch stability probe; explicitly not a WHU-MARS accuracy experiment."""
++import argparse
++import json
++import sys
++from pathlib import Path
++
++import torch
++from torch import nn
++from torch.nn import functional as F
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
++from model.modules import A1LocalEnhancement, A2FeatureModulation
++from processor.processor import PCA, GPD, PrototypeBank
++from loss.wrt_loss import TripletLoss_WRT
++
++
++def probe(kind, steps, device):
++    torch.manual_seed(1234)
++    module = (A1LocalEnhancement() if kind == 'a1' else A2FeatureModulation()).to(device)
++    neck = nn.BatchNorm1d(768).to(device)
++    head = nn.Linear(768, 3, bias=False).to(device)
++    local_neck = nn.BatchNorm1d(768).to(device) if kind == 'a1' else None
++    local_head = nn.Linear(768, 3, bias=False).to(device) if kind == 'a1' else None
++    parameters = list(module.parameters()) + list(neck.parameters()) + list(head.parameters())
++    if kind == 'a1':
++        parameters += list(local_neck.parameters()) + list(local_head.parameters())
++    optimizer = torch.optim.SGD(parameters, lr=0.008, momentum=0.9, weight_decay=1e-4)
++    bank = PrototypeBank(3, 768, device=device)
++    target = torch.tensor([0, 0, 1, 1], device=device)
++    target_rep = target.repeat(3)
++    wrt = TripletLoss_WRT()
++    records = []
++    for step in range(steps):
++        optimizer.zero_grad()
++        # Random tokens simulate original LN12 CLS/P12; raw P11 for A1.
++        cls = F.layer_norm(torch.randn(12, 768, device=device), (768,))
++        patches = torch.randn(12, 128, 768, device=device)
++        if kind == 'a2':
++            patches = F.layer_norm(patches, (768,))
++            z, details = module(cls, patches, True)
++        else:
++            z, local, details = module(cls, patches, True)
++        loss = F.cross_entropy(head(neck(z)), target_rep) + wrt(z, target_rep)[0]
++        pca, ids, centers = PCA(z, target, 3, group_size=2)
++        loss = loss + 0.01 * pca + GPD(z, target, bank, ids, centers, 3)
++        if kind == 'a1':
++            loss = loss + 0.05 * F.cross_entropy(local_head(local_neck(local)), target_rep)
++        loss.backward()
++        gradient_norms = {n: p.grad.norm().item() for n, p in module.named_parameters()}
++        assert all(torch.isfinite(p.grad).all() for p in module.parameters())
++        assert all(v > 0 for v in gradient_norms.values())
++        torch.nn.utils.clip_grad_norm_(parameters, 1.0)
++        optimizer.step()
++        bank.update(ids, centers, ddp=False)
++        assert torch.isfinite(loss)
++        record = {'step': step + 1, 'loss': loss.item(), 'cls_norm': cls.norm(dim=1).mean().item(),
++                  'z_norm': z.norm(dim=1).mean().item(),
++                  'relative_perturbation': ((z - cls).norm() / cls.norm()).item(),
++                  'gradient_norms': gradient_norms}
++        if kind == 'a2':
++            mask = details['mask'].detach()
++            record.update(mask_mean=mask.mean().item(), mask_std=mask.std().item(),
++                          mask_min=mask.min().item(), mask_max=mask.max().item())
++        if step in (0, steps - 1) or (step + 1) % 10 == 0:
++            records.append(record)
++            print(kind, {k: round(v, 6) if isinstance(v, float) else v
++                         for k, v in record.items() if k != 'gradient_norms'}, flush=True)
++    return records
++
++
++if __name__ == '__main__':
++    parser = argparse.ArgumentParser()
++    parser.add_argument('--steps', type=int, default=50)
++    parser.add_argument('--device', default='cpu')
++    parser.add_argument('--output', default='logs/feature_aug_synthetic_check.json')
++    args = parser.parse_args()
++    if args.steps <= 0:
++        parser.error('--steps must be positive')
++    torch.set_num_threads(2)
++    result = {kind: probe(kind, args.steps, args.device) for kind in ('a1', 'a2')}
++    path = Path(args.output)
++    path.parent.mkdir(parents=True, exist_ok=True)
++    path.write_text(json.dumps({'synthetic_only': True, 'device': args.device,
++                               'steps_per_branch': args.steps, 'results': result}, indent=2))
++    print('PASS: finite losses/features and nonzero finite gradients in all branch parameters')
+--- /dev/null
++++ after/WHU/IMPLEMENTATION_A1_A2.md
+@@ -0,0 +1,229 @@
++# UAD + A1/A2 实现说明与验收记录
++
++本实现对应工作区 `idea` 的实施版 V1.0。Baseline、A1、A2 是三个独立运行模式；一次运行只创建所选分支。`FEATURE_AUG.TYPE=none` 仍默认使用原 UAD 的 CE + WRT + ProCA + GPD，不等于 `SOLVER.LOSS_TYPE=base`。
++
++## 论文依据与适配边界
++
++逐项以提供的 PDF 为方法依据，再检查本地参考代码。方案中的明确简化优先用于本次实验；未指定的实现细节采用对应论文的 Transformer 结构。
++
++| 依据 | 论文方法 | 本次实现 |
++| --- | --- | --- |
++| WHU §4.2–4.5，Fig.3 | 单分支、共享 BNNeck、CE/WRT、两级中心与全局原型 | 保留原函数、数据排列、损失权重和 EMA 时序，用最终 z 替换原 CLS |
++| ViSA §3.3 ETGM、§3.4 DLFM、Eq.8–13 | 专家 Query、相似度 Top-K、Query 增广图与 GCN、全局/局部融合 | A1 用两个 CLS 条件 Query、独立 Top-K、共享一层 Patch MHA、连续分数加权、局部残差 |
++| ViSA §3.5、Eq.20 | 全局/局部 CE 和 Triplet，视角与专家正则 | A1 只增加 0.05 × Local CE |
++| QVAM §3.2、Eq.1，Fig.2(b) | Query Self-Attention → Patch Cross-Attention → FFN | A2 用一层、4 Query、192 维；Cross-Attention 后不加回原 Query |
++| QVAM §3.3、Eq.3–5，Fig.2(c) | CLS 条件 mask token，读取视角 Query，Sigmoid 调制 | A2 用 detach CLS 条件，读取 Patch 条件 Query，不加回 mask 读取 Query，改成有界残差缩放 |
++| DeCLIP §3.1–3.2、Eq.4–10，Fig.5 | 最后一层 QQ 关系、内容/上下文双教师蒸馏 | 仅作“局部内容与关系分别处理”的辅助依据，未添加 QQ 替换、教师、CLIP 或蒸馏损失 |
++
++本地代码核对位置：
++
++- `../ViSA/fastreid/modeling/backbones/vision_transformer_multiview_ViSA.py`：末层前 token、ETGM、Top-K、图学习。
++- `../ViSA/fastreid/modeling/meta_arch/baseline_multi_view_ViSA.py`：局部身份监督。
++- `../QVAM/fastreid/modeling/QVAM/QVAM.py`：VAD/AFM 与初始化。
++- `../QVAM/fastreid/modeling/meta_arch/baseline_multi_view.py`：原方法的多项监督与双视角原型。
++- `../DeCLIP/src/open_clip/transformer.py`、`../DeCLIP/src/training/declip.py`：最后一层关系改造、内容和上下文蒸馏。
++
++不能把 A1/A2 称为原 ViSA/QVAM 的完整复现，也不能把 DeCLIP 在 CLIP 中的观察直接当作已经在 UAD 中验证的事实。ViSA 的 Eq.4 将身份互信息写为 minimized，而附近文字描述为最大化；本实验遵循身份 CE 的明确监督设计。ViSA 本地代码的图构造包含 `no_grad()`，本次按方案保留分数与 Patch 聚合的梯度，未复制这一实现。
++
++官方入口交叉核对：[WHU-MARS](https://github.com/msm8976/WHU-MARS)、[ViSA](https://github.com/Cat-Zero/ViSA)、[QVAM](https://github.com/Sakuraandroxy/QVAM)、[DeCLIP](https://github.com/xiaomoguhz/DeCLIP)。本次以工作区 WHU 为训练/评测协议基准。
++
++## 文件变更清单
++
++| 文件 | 类型 | 功能、目的与关键细节 |
++| --- | --- | --- |
++| `config/defaults.py` | 修改 | 声明 FEATURE_AUG 的全部字段与 SOLVER.RESUME；默认 none |
++| `model/backbones/vit_pytorch.py` | 修改 | 单次前向可返回 L11 未经最终 LN 的 Patch，或 L12 最终 LN 后的 Patch；不改变 CLS。ImageNet 加载保留位置插值和旧 Patch 权重转换，并拒绝非预期漏加载 |
++| `model/make_model.py` | 修改 | 按模式实例化分支、计算 z；A1 独立局部 BNNeck/分类器；统一训练字典；推理 Tensor 和 mode 参数不变；加载元数据 |
++| `loss/make_loss.py` | 修改 | 将主 CE 的真实 criterion 暴露为 `loss_func.id_criterion`，供局部 CE 复用；原主损失公式不变 |
++| `processor/processor.py` | 修改 | 读取训练字典；仅 A1 加局部 CE 与日志；在原模型权重之外保存完整训练状态；严格续训 |
++| `train.py` | 修改 | 校验 resume 配置；原 CUDA_VISIBLE_DEVICES、torchrun/NCCL、rank 设置保持 |
++| `test.py` | 修改 | 测试直接严格加载整模型，不再依赖 ImageNet 预训练文件 |
++| `model/modules/__init__.py` | 新增 | 导出两种独立分支 |
++| `model/modules/common.py` | 新增 | 显式初始化 Linear、MHA 的 in/out projection、LayerNorm；维度检查 |
++| `model/modules/a1_local.py` | 新增 | 可微分数加权的局部身份增强 |
++| `model/modules/a2_modulation.py` | 新增 | Patch 条件提取、Mask 读取和有界调制 |
++| `utils/checkpoint.py` | 新增 | 严格共享参数迁移、同结构加载、元数据、完整状态保存/恢复 |
++| `configs/UAD_A1.yml` | 新增 | 复制原 UAD 配置，仅新增 A1 字段和独立输出目录 |
++| `configs/UAD_A2.yml` | 新增 | 复制原 UAD 配置，仅新增 A2 字段和独立输出目录 |
++| `tests/test_feature_aug.py` | 新增 | 基线逐元素回归、真实 ViT 集成、梯度、初始化、优化器、加载与续训验收 |
++| `tests/ddp_feature_aug.py` | 新增 | 两 rank 的 DDP 参数/原型同步、连续迭代、不同推理次数、rank 状态恢复验收 |
++| `tools/check_feature_aug.py` | 新增 | 两分支各 50 次合成优化，输出 Mask/范数/梯度诊断；不是数据集精度试验 |
++| `IMPLEMENTATION_A1_A2.md` | 新增 | 本说明 |
++
++未删除原有源文件。原 `configs/UAD.yml`、数据集与 transforms、两个 PKM sampler、`utils/metrics.py`、`solver/make_optimizer.py` 保持原文件；ProCA、GPD、PrototypeBank 的实现保持原函数。优化器继续自动收集注册参数，没有增加新学习率策略。
++
++工作区无 Git 元数据，修改前快照与 SHA256 清单位于 `../tmp/uad_original/`，用于本次原版回归。PDF 阅读缓存与隔离 DDP 测试环境位于 `../tmp/`，不是模型运行依赖。
++
++## A1 架构与梯度
++
++```mermaid
++flowchart LR
++ I[图像] --> V[原 ViT L1-L11]
++ V --> G[L12 + 原 LN → CLS c]
++ V --> P[L11 Patch → 独立 LN → Linear 768→192]
++ G --> Q[detach c → Linear 768→384 + 两个 Query]
++ P --> S[FP32 cosine → 每 Query Top-K]
++ Q --> S
++ S --> A[选中 Patch → 共享 4-head Self-Attention]
++ S --> W[可微 softmax 分数 / 0.1]
++ A --> U[加权求和 → 拼接384 → Linear768 → 无仿射LN → u]
++ W --> U
++ G --> Z[z = c + 0.05 u]
++ U --> Z
++ Z --> L[原 UAD 主损失]
++ U --> C[局部 BNNeck + 分类器 → 0.05 Local CE]
++```
++
++默认输入 256×128、Patch/stride 16，N=128；代码不写死 N。第 11 个 Block 是 `blocks[10]`，Patch 不 detach，不复制第 12 层。每个 Query 选择 `min(16,N)` 个位置，两组允许重叠，无额外多样性损失。
++
++\[
++\widetilde P=W_p LN_{11}(P_{11}),\quad Q=Q_0+reshape(W_q\,sg(c))
++\]
++\[
++s_{ji}=cos(q_j,\widetilde p_i),\quad a_j=softmax(TopK(s_j)/0.1)
++\]
++\[
++H_j=V_j+MHA(LN(V_j)),\quad h_j=\sum_i a_{ji}H_{ji}
++\]
++\[
++u=LN_{\text{no affine}}(W_o[h_1;h_2]),\quad z=c+0.05u
++\]
++
++Top-K 索引不可微，选中分数参与 softmax 后可微。余弦矩阵乘法和 softmax 显式关闭 autocast 并在 FP32 计算，然后转换权重为 Value dtype。最终 Value 来自 Patch，Query/CLS 未被直接拼进 u。`detach(c)` 仅切断条件读取对 CLS 的直接反传；Patch 与 CLS 共用主干，因此不意味着统计独立或完全阻断共享主干梯度。
++
++普通投影、MHA in/out 投影和 Query 使用截断正态 std=0.02，bias=0；独立 LN 为 weight=1、bias=0。局部 BNNeck/分类器沿用原 UAD 初始化规则。A1 分支参数 889,152；500 个身份时，加上局部 BNNeck/分类器共新增 1,274,688 个参数（其中局部 BN bias 768 个参数冻结）。
++
++## A2 架构、初始化与边界
++
++```mermaid
++flowchart LR
++ I[图像] --> V[原 ViT L1-L12 + 原最终LN]
++ V --> C[CLS c]
++ V --> P[L12 Patch → Linear768→192]
++ Q[4个可学习Query] --> S[4-head Self-Attention + 残差]
++ S --> D[Patch Cross-Attention → 条件FFN + 条件残差]
++ P --> D
++ C --> M[detach c → Linear768→192 + Mask Token]
++ M --> R[AFM Cross-Attention]
++ D --> R
++ R --> H[LN192 → Linear384 → GELU → LN384 → Linear768 → Sigmoid]
++ H --> Z[z = c × 1+0.2×2M-1]
++ C --> Z
++ Z --> L[原 UAD 主损失]
++```
++
++精确缩放公式为：
++
++\[
++Q_s=Q_0+SelfAttn(LN(Q_0)),\quad Q_{read}=CrossAttn(LN(Q_s),\widetilde P_{12},\widetilde P_{12})
++\]
++\[
++Q_{cond}=Q_{read}+FFN(LN(Q_{read})),\quad m_0=m_{learn}+W_c\,sg(c)
++\]
++\[
++m_{cond}=CrossAttn(LN(m_0),Q_{cond},Q_{cond})
++\]
++\[
++M=\sigma(W_2 LN_{384}(GELU(W_1 LN_{192}(m_{cond})))),\quad
++z=c\odot[1+0.2(2M-1)]
++\]
++
++VAD 采用论文中的 FFN，轻量化为 192→384→192，残差仅作用于已经读取 Patch 的条件；没有 `Q_s + CrossAttn(...)`，也没有 `m_0 + CrossAttn(...)`。AFM 不额外复制 QVAM 的第二次 Query Self-Attention、多层循环或最终增强 FFN，按方案固定的简化路径实施。
++
++普通层与 MHA 的所有投影、Query/Mask Token 为截断正态 std=0.02、bias=0；LN 为 weight=1、bias=0。Mask 最后一层覆盖为 Normal(mean=0,std=0.005)，bias=0，避免零初始化切断上游初始梯度。Sigmoid 使缩放有界于 [0.8,1.2]。A2 共新增 1,261,440 个参数，没有局部分类头。
++
++CLS 仍可通过注意力权重影响 Mask。Value 路径来自 Patch 条件，不保证这些条件一定具有有用的视角语义；需要真实数据消融证明。
++
++## 损失、输出与协议
++
++\[
++\mathcal L_{UAD}(z)=\mathcal L_{CE}(Classifier(BN(z)),y)
+++\mathcal L_{WRT}(z,y)+0.01\mathcal L_{ProCA}(z)+\mathcal L_{GPD}(z)
++\]
++\[
++\mathcal L_{A1}=\mathcal L_{UAD}(z)+0.05\mathcal L_{CE}(LocalClassifier(LocalBN(u)),y)
++\]
++\[
++\mathcal L_{A2}=\mathcal L_{UAD}(z)
++\]
++
++CE 与 WRT 的可配置权重仍使用原 `ID_LOSS_WEIGHT` 和 `TRIPLET_LOSS_WEIGHT`，以上为 UAD.yml 默认值。原 ProCA/GPD 开关继续由 `SOLVER.LOSS_TYPE` 控制。
++
++训练 `mode=0` 返回 `cls_score/global_feat/bn_feat/local_feat/local_score` 字典，其中 `global_feat=z`；Baseline/A2 的后两项为 None。外部自定义训练脚本若原来解包三个 Tensor，需要改为读取字典。官方单卡/DDP processor 已同步适配。
++
++模态顺序仍为 RGB、IR、Thermal，各模态 batch 在第 0 维拼接；所有身份 CE 使用 `target.repeat(num_modalities)`。WRT、ProCA、GPD 全部使用 BN 前 z。主 CE 使用 BN(z)。GPD 的原型更新仍在反传、裁剪、优化器/Scaler 更新之后，DDP 原型更新仍使用原 all_gather。
++
++推理 `mode=1/2/3` 返回 Tensor。`NECK_FEAT=before` 返回 z，`after` 返回 BN(z)。归一化、同相机排除、跨模态/平台子协议等仍由原 evaluator 处理。每张图像仍使用一次主干前向。
++
++## 权重加载与完整续训
++
++- `imagenet`：复用原位置插值/Patch 形状转换；仅允许未使用的 ImageNet 分类头和新 SIE 缺失，其余主干漏加载、意外 key 和形状错误直接报错。加载数量、key、分类头跳过及插值信息进入日志。
++- `uad_init`：清理开头的 `module.`，完整核对所有 Baseline 参数/缓冲区；缺失集合必须恰好等于当前新增分支/局部头的 key。类别数不同报错，不静默跳过主分类器。
++- `eval`：同结构全部 key/shape 严格加载；新权重检查类型、主干、维度、身份类别数、Query、gamma、初始化配置和版本。
++- `SOLVER.RESUME`：只接受完整 `*_resume.pth`；加载 optimizer、center optimizer/criterion、scheduler、AMP scaler、epoch、PrototypeBank、每 rank Python/NumPy/PyTorch/当前 GPU RNG 和 BN buffers。恢复到下一完整 epoch，不支持 epoch 中间任意 batch 的精确恢复。
++
++保留原 `transformer_EPOCH.pth` 模型格式，另写 `transformer_EPOCH.pth.meta.json`；完整训练状态为 `transformer_EPOCH_resume.pth`。完整状态在本 epoch 验证结束之后保存，各 rank 参与状态收集。原模型权重仍在原保存位置生成。
++
++严格恢复要求 world size、训练配置、训练数据清单和 loader 设置一致；`OUTPUT_DIR`、日志频率、检查点频率与预训练加载路径允许不同。原 PKM 迭代长度是动态估计，因此比较数据清单 hash/batch 设置，不比较易变化的 `len(loader)`。原 DataLoader 无 persistent workers，恢复 RNG 后下一 epoch 的 worker seed 可重建；不支持 persistent workers 的精确恢复。
++
++旧版原始 UAD 权重没有元数据时可以严格检查 key/shape，但不能确认 gamma 等非 Tensor 设置，加载器会明确记录此限制。新模型文件配合 `.meta.json` 或直接使用完整 `_resume.pth` 可检查这些设置。模型参数初始化不等于完整续训。
++
++公平首轮实验均从同一 ImageNet 权重开始；`uad_init` 只是迁移试验，不能与从 ImageNet 开始的 Baseline 视为相同训练起点。
++
++## 运行命令
++
++在 WHU 目录运行。把 `/path/to/data` 替换成包含 `WHU-MARS/train|query|test` 的父目录，预训练权重替换成真实路径。原目录名 IR/Thermal 保持现有数据约定。
++
++```bash
++# 单卡 A1；A2 替换配置与 OUTPUT_DIR 即可。
++CUDA_VISIBLE_DEVICES=0 python train.py --config_file configs/UAD_A1.yml \
++  DATASETS.ROOT_DIR /path/to/data MODEL.PRETRAIN_PATH /path/to/jx_vit_base_p16_224-80ecf9dd.pth \
++  MODEL.DIST_TRAIN False SOLVER.IMS_PER_BATCH 64 SOLVER.BASE_LR 0.008 \
++  OUTPUT_DIR logs/UAD_A1_1000_single
++
++# 四卡，沿用现有 WHU README 的全局 batch / 学习率设置。
++CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --standalone --nproc_per_node=4 train.py \
++  --config_file configs/UAD_A1.yml DATASETS.ROOT_DIR /path/to/data \
++  MODEL.PRETRAIN_PATH /path/to/jx_vit_base_p16_224-80ecf9dd.pth \
++  MODEL.DIST_TRAIN True SOLVER.IMS_PER_BATCH 256 SOLVER.BASE_LR 0.032 \
++  OUTPUT_DIR logs/UAD_A1_1000_DDP
++
++# 完整续训：其余训练配置必须与保存时一致。
++CUDA_VISIBLE_DEVICES=0 python train.py --config_file configs/UAD_A1.yml \
++  DATASETS.ROOT_DIR /path/to/data MODEL.PRETRAIN_CHOICE resume \
++  SOLVER.RESUME logs/UAD_A1_1000_single/transformer_10_resume.pth \
++  OUTPUT_DIR logs/UAD_A1_1000_single
++
++# 模型评测，必须选择匹配的 A1/A2 配置。
++CUDA_VISIBLE_DEVICES=0 python test.py --config_file configs/UAD_A1.yml \
++  DATASETS.ROOT_DIR /path/to/data TEST.WEIGHT logs/UAD_A1_1000_single/transformer_120.pth \
++  OUTPUT_DIR logs/UAD_A1_1000_eval
++
++# CPU 实现验收与合成分支试跑。
++python -m pytest tests/test_feature_aug.py -q
++python tools/check_feature_aug.py --steps 50
++python tests/ddp_feature_aug.py --output logs/acceptance_ddp
++```
++
++Windows 单卡命令使用 PowerShell `$env:CUDA_VISIBLE_DEVICES='0'` 后执行同一 `python train.py ...`；原生产 DDP 入口要求 CUDA/NCCL，应在支持 NCCL 的 GPU 环境执行。
++
++Baseline/A1/A2 比较应采用同一 dataset split、图像尺寸、预训练权重、world size、batch、学习率和 seed。原 README 的四卡设置给每 rank 64 个采样单位 × 3 模态 = 192 张图；本次不擅自变更这些已存在的缩放决策。
++
++## 当前验证范围
++
++实现阶段的主环境：Python 3.9、PyTorch 2.8.0+cpu、torchvision 0.23.0+cpu，无 CUDA。工作区未包含真实数据、原 UAD 权重或历史训练日志。完整数据集训练和精度比较尚不能在此环境执行。
++
++CPU pytest 已通过 14 项验收，含：
++
++- 修改前快照与修改后 Baseline 的所有 state key/value 一致；随机种子相同的 train 输出和 eval 的 before/after、mode=1/2/3 均逐元素完全一致（rtol=atol=0）。此测试使用相同随机初始化权重，未使用未提供的原训练权重。
++- L11/L12 token 位置、LN 边界、每 Block 只执行一次；N=1/7/128 的动态选择。
++- A1 连续 Top-K 分数、Query、投影、关系层与 Patch 梯度；AMP 下分数保持 FP32。
++- A2 shape、初始 Mask、缩放范围、Patch 依赖、VAD/AFM/Mask 全部参数梯度。
++- Baseline/A1/A2 的真实 12-block、768 维主干与默认 256×128 输入集成前后向，原 CE/WRT/ProCA/GPD，推理契约，全部可训练参数恰好进入优化器一次。
++- 标签平滑复用，迁移加载、缺失/类别错误拒绝、ImageNet 位置插值与漏加载拒绝，完整续训下一步 loss/模型/原型/RNG 精确一致。
++
++`logs/feature_aug_synthetic_check.json` 是 A1/A2 各 50 次合成优化的记录。初始 A1 相对扰动约 4.995%；A2 Mask mean=0.500432、std=0.024504，相对扰动约 0.979%。各步损失/特征/梯度有限，所有分支参数梯度非零。A2 在独立随机 tokens 上存在部分 AFM 读取条件参数的很小梯度（首步 CLS projection 梯度范数约 5.7e-7），且 Mask 均值随优化下降；这只证明计算图与数值可运行，不能证明身份/视角信息利用或检索提升，真实试跑仍需检查这些量。
++
++双进程 CPU/Gloo 实测已通过：Baseline/A1/A2 每种运行两个连续优化步骤，全部新增参数获得非零有限梯度，各 rank 模型参数与 GPD 原型完全同步；绕过 DDP wrapper 执行不同次数的验证前向未死锁；完整续训下一步 loss/模型与各 rank RNG/BN buffers 精确恢复。测试用真实 12-block、768 维主干和缩小的 32×32 输入，恢复测试采用小模型。
++
++具体结果见 `logs/acceptance_results.json` 与 `logs/acceptance_ddp/rank_*.json`。主环境的 Gloo 初始化错误与 PyTorch Windows 构建相关，可参见 [PyTorch 官方 issue](https://github.com/pytorch/pytorch/issues/150381)。成功实测使用 `../tmp/ddp-runtime/` 隔离环境中的 PyTorch 2.7.1+cpu / torchvision 0.22.1+cpu，未替换全局 Python 依赖。CPU/Gloo 测试不能代替 CUDA AMP/NCCL 四卡实测。依用户要求，仅开展当前条件可完成的自检，不进行真实数据训练。
